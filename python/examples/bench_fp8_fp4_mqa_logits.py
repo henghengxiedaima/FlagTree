@@ -17,7 +17,7 @@
 Three implementations compared for correctness and performance:
   1. vLLM (DeepGEMM)
   2. FlagGems
-  3. TLE (self-contained, no external dependencies; to be optimized with TLE primitives)
+  3. TLE (standalone kernel — zero optimization, baseline for future TLE primitive work)
 
 Usage:
     python bench_fp8_fp4_mqa_logits.py
@@ -52,7 +52,7 @@ except ImportError as e:
 
 
 # =============================================================================
-# Fallback FP8 quantization (when vLLM's per_custom_dims_cast_to_fp8 is missing)
+# Fallback FP8 quantization
 # =============================================================================
 
 def _simple_per_dim_cast_to_fp8(x, dims, is_scale_transposed=False):
@@ -60,11 +60,9 @@ def _simple_per_dim_cast_to_fp8(x, dims, is_scale_transposed=False):
     amax = x.abs()
     for d in sorted(dims, reverse=True):
         amax = amax.amax(dim=d, keepdim=True)
-    # FP8 e4m3fn max representable value ≈ 448 (before scaling)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     scale = amax / fp8_max
     x_fp8 = (x / scale).to(torch.float8_e4m3fn)
-    # Squeeze reduced dims from scale
     for d in sorted(dims, reverse=True):
         scale = scale.squeeze(d)
     return x_fp8, scale
@@ -78,112 +76,24 @@ def cast_to_fp8(x, dims, is_scale_transposed=False):
 
 
 # =============================================================================
-# TLE Standalone Implementation (self-contained, no flag_gems dependencies)
+# TLE Standalone Kernels (zero optimization — same logic as FlagGems,
+# stripped of flag_gems imports / decorators)
 # =============================================================================
 
-_CLEAN_BLOCK_M = 8
-_CLEAN_BLOCK_N = 128
-
-# Candidate configs for mini auto-tuning: (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages)
-# HEAD_BLOCK can only use divisors of H=64: 1, 2, 4, 8
-_TLE_CANDIDATE_CONFIGS = [
-    # Decode-oriented (small M, large N)
-    (32, 128, 1, 4, 2),
-    (64, 128, 1, 4, 2),
-    (64, 64, 1, 4, 2),
-    # Prefill-oriented — batch more heads per iteration
-    (64, 128, 2, 4, 3),
-    (64, 128, 4, 4, 3),
-    (128, 64, 2, 4, 3),
-    (128, 64, 4, 8, 3),
-    (128, 128, 2, 4, 2),
-    (128, 128, 4, 8, 2),
-    (64, 64, 2, 4, 3),
-]
-
-_TLE_TUNE_ITERS = 3
-
-
-def _tune_config(M, N, H, D, q_values, k_values, k_scales, weights):
-    """Mini auto-tuner: try candidate configs, return the fastest one."""
-    # Filter configs by problem constraints
-    candidates = []
-    for cfg in _TLE_CANDIDATE_CONFIGS:
-        blk_m, blk_n, hb, nw, ns = cfg
-        if H % hb != 0:
-            continue
-        # BLOCK_M shouldn't be excessively larger than M
-        if blk_m > M * 4 and M > 0:
-            continue
-        candidates.append(cfg)
-
-    if not candidates:
-        return _TLE_CANDIDATE_CONFIGS[0]
-
-    best_cfg = candidates[0]
-    best_time = float("inf")
-
-    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
-
-    for cfg in candidates:
-        blk_m, blk_n, hb, nw, ns = cfg
-        grid = (triton.cdiv(M, blk_m), triton.cdiv(N, blk_n))
-        try:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(_TLE_TUNE_ITERS):
-                _tle_fp8_fp4_mqa_logits_kernel[grid](
-                    q_values, k_values, k_scales, weights, logits,
-                    M, N, H, D,
-                    q_values.stride(0), q_values.stride(1), q_values.stride(2),
-                    k_values.stride(0), k_values.stride(1),
-                    logits.stride(0), logits.stride(1),
-                    weights.stride(0), weights.stride(1),
-                    BLOCK_M=blk_m, BLOCK_N=blk_n, HEAD_BLOCK=hb,
-                    num_warps=nw, num_stages=ns,
-                )
-            torch.cuda.synchronize()
-            elapsed = (time.perf_counter() - t0) / _TLE_TUNE_ITERS
-            if elapsed < best_time:
-                best_time = elapsed
-                best_cfg = cfg
-        except Exception:
-            continue
-
-    return best_cfg
-
-
 @triton.jit
-def _tle_fp8_fp4_mqa_logits_kernel(
-    Q_ptr,
-    K_ptr,
-    K_scale_ptr,
-    W_ptr,
-    O_ptr,
-    M,
-    N,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    stride_qm,
-    stride_qh,
-    stride_qd,
-    stride_kn,
-    stride_kd,
-    stride_om,
-    stride_on,
-    stride_wm,
-    stride_wh,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
+def _tle_mqa_logits_kernel(
+    Q_ptr, K_ptr, K_scale_ptr, W_ptr, O_ptr,
+    M, N,
+    H: tl.constexpr, D: tl.constexpr,
+    stride_qm, stride_qh, stride_qd,
+    stride_kn, stride_kd,
+    stride_om, stride_on,
+    stride_wm, stride_wh,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_BLOCK: tl.constexpr,
 ):
-    """Fused FP8 MQA logits with head-batched tiled dot products.
+    """Fused FP8 MQA logits — head-batched tiled dot products.
 
-    Computes logits[m, n] = sum_h(ReLU(sum_d(q[m,h,d]*k[n,d]) * k_scale[n])
-                                  * weights[m, h])
-
-    K is loaded once per (BLOCK_M, BLOCK_N) tile and reused across HEAD_BLOCK
-    heads to minimize global memory traffic.
+    logits[m,n] = sum_h(ReLU(sum_d(q[m,h,d]*k[n,d]) * k_scale[n]) * weights[m,h])
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -195,60 +105,42 @@ def _tle_fp8_fp4_mqa_logits_kernel(
     m_mask = m_offs < M
     n_mask = n_offs < N
 
-    # Load K tile once — reused across all head batches
+    # K loaded once, reused across HEAD_BLOCK head batches
     k = tl.load(
         K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
-        mask=n_mask[:, None] & (d_offs[None, :] < D),
-        other=0.0,
+        mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0,
     )
-
     k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
 
-    # Accumulator for output: [BLOCK_M, BLOCK_N] in fp32
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     for hb in range(0, H, HEAD_BLOCK):
         hb_offs = hb + tl.arange(0, HEAD_BLOCK)
 
-        # Load Q for this head batch: [BLOCK_M, HEAD_BLOCK, D]
         q = tl.load(
-            Q_ptr
-            + m_offs[:, None, None] * stride_qm
-            + hb_offs[None, :, None] * stride_qh
-            + d_offs[None, None, :] * stride_qd,
+            Q_ptr + m_offs[:, None, None] * stride_qm
+                  + hb_offs[None, :, None] * stride_qh
+                  + d_offs[None, None, :] * stride_qd,
             mask=m_mask[:, None, None]
-            & (hb_offs[None, :, None] < H)
-            & (d_offs[None, None, :] < D),
+                 & (hb_offs[None, :, None] < H)
+                 & (d_offs[None, None, :] < D),
             other=0.0,
         )
 
-        # Flatten to 2D for MMA: [BLOCK_M * HEAD_BLOCK, D]
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
-
-        # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
         dot = tl.dot(q_2d, tl.trans(k))
+        dot = tl.maximum(dot * k_scale[None, :], 0.0)  # k_scale + ReLU
 
-        # Fused k_scale + ReLU activation
-        dot = tl.maximum(dot * k_scale[None, :], 0.0)
-
-        # Load weights for this head batch: [BLOCK_M, HEAD_BLOCK]
         w = tl.load(
             W_ptr + m_offs[:, None] * stride_wm + hb_offs[None, :] * stride_wh,
-            mask=m_mask[:, None] & (hb_offs[None, :] < H),
-            other=0.0,
+            mask=m_mask[:, None] & (hb_offs[None, :] < H), other=0.0,
         )
-
-        # Weight each head's contribution
         w_flat = tl.reshape(w, [BLOCK_M * HEAD_BLOCK])
         dot = dot * w_flat[:, None]
 
-        # Reduce over head dimension: [BLOCK_M, HEAD_BLOCK, BLOCK_N] -> sum
         dot_3d = tl.reshape(dot, [BLOCK_M, HEAD_BLOCK, BLOCK_N])
-        dot_reduced = tl.sum(dot_3d, axis=1)
+        acc += tl.sum(dot_3d, axis=1)
 
-        acc += dot_reduced
-
-    # Store output tile
     write_mask = m_mask[:, None] & n_mask[None, :]
     out_ptrs = O_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
     tl.store(out_ptrs, acc, mask=write_mask)
@@ -256,15 +148,9 @@ def _tle_fp8_fp4_mqa_logits_kernel(
 
 @triton.jit
 def _tle_clean_logits_kernel(
-    O_ptr,
-    KS_ptr,
-    KE_ptr,
-    M,
-    N,
-    stride_om,
-    stride_on,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    O_ptr, KS_ptr, KE_ptr, M, N,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """Fill invalid positions with -inf based on per-row [ks, ke) ranges."""
     pid_m = tl.program_id(0)
@@ -284,24 +170,39 @@ def _tle_clean_logits_kernel(
 
     neg_inf = float("-inf")
     out_ptrs = O_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
-    tl.store(
-        out_ptrs,
-        neg_inf + tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32),
-        mask=write_mask,
-    )
+    tl.store(out_ptrs, neg_inf + tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32),
+             mask=write_mask)
 
 
-def _tle_fp8_fp4_mqa_logits_launch(
-    q_values, k_values, k_scales, weights, logits,
-    M, N, H, D, ks, ke, clean_logits,
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
-):
-    """Launch TLE kernel with pre-selected config (no autotuning)."""
-    if logits is None:
-        logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
+# =============================================================================
+# TLE wrapper — simple fixed config, no auto-tuning
+# =============================================================================
+
+# Fixed config: (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages)
+# HEAD_BLOCK must divide H=64: valid values → 1, 2, 4, 8
+_TLE_CONFIG = (64, 128, 2, 4, 2)
+_CLEAN_M = 8
+_CLEAN_N = 128
+
+
+def tle_fp8_fp4_mqa_logits(
+    q: tuple, kv: tuple,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """TLE standalone fp8_fp4_mqa_logits — zero optimization baseline."""
+    q_values, _ = q
+    k_values, k_scales = kv
+    M, H, D = q_values.shape
+    N = k_values.shape[0]
+
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _TLE_CONFIG
+
+    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    _tle_fp8_fp4_mqa_logits_kernel[grid](
+    _tle_mqa_logits_kernel[grid](
         q_values, k_values, k_scales, weights, logits,
         M, N, H, D,
         q_values.stride(0), q_values.stride(1), q_values.stride(2),
@@ -313,75 +214,26 @@ def _tle_fp8_fp4_mqa_logits_launch(
     )
 
     if clean_logits:
-        clean_grid = (triton.cdiv(M, _CLEAN_BLOCK_M), triton.cdiv(N, _CLEAN_BLOCK_N))
+        clean_grid = (triton.cdiv(M, _CLEAN_M), triton.cdiv(N, _CLEAN_N))
         _tle_clean_logits_kernel[clean_grid](
-            logits, ks, ke, M, N, logits.stride(0), logits.stride(1),
-            BLOCK_M=_CLEAN_BLOCK_M, BLOCK_N=_CLEAN_BLOCK_N,
+            logits, cu_seqlen_ks, cu_seqlen_ke, M, N,
+            logits.stride(0), logits.stride(1),
+            BLOCK_M=_CLEAN_M, BLOCK_N=_CLEAN_N,
         )
 
     return logits
 
 
-def tle_fp8_fp4_mqa_logits(
-    q: tuple,
-    kv: tuple,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    clean_logits: bool = True,
-) -> torch.Tensor:
-    """TLE standalone implementation of fp8_fp4_mqa_logits.
-
-    Self-contained — no flag_gems or vLLM dependencies.
-
-    Args:
-        q: Tuple of (q_values [M, H, D] fp8, q_scale or None).
-        kv: Tuple of (k_values [N, D] fp8, k_scales [N] fp32).
-        weights: [M, H] fp32 per-head weights.
-        cu_seqlen_ks: [M] int32 start indices for valid K range.
-        cu_seqlen_ke: [M] int32 end indices for valid K range.
-        clean_logits: Whether to fill invalid positions with -inf.
-
-    Returns:
-        logits: [M, N] fp32 output tensor.
-    """
-    q_values, _ = q
-    k_values, k_scales = kv
-
-    M, H, D = q_values.shape
-    N = k_values.shape[0]
-
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _tune_config(
-        M, N, H, D, q_values, k_values, k_scales, weights)
-
-    return _tle_fp8_fp4_mqa_logits_launch(
-        q_values, k_values, k_scales, weights, None,
-        M, N, H, D, cu_seqlen_ks, cu_seqlen_ke, clean_logits,
-        BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
-    )
-
-
 # =============================================================================
-# Benchmark infrastructure
+# Benchmark
 # =============================================================================
 
-# DeepSeek V4 production config
 H = 64
 D = 128
 
-# Test shapes: (M, N) covering decode and prefill workloads
 BENCH_SHAPES = [
-    # decode
-    (1, 1024),
-    (1, 2048),
-    (4, 2048),
-    (4, 4096),
-    # prefill
-    (64, 4096),
-    (256, 4096),
-    (1024, 4096),
-    (2048, 4096),
-    (1024, 8192),
+    (1, 1024), (1, 2048), (4, 2048), (4, 4096),        # decode
+    (64, 4096), (256, 4096), (1024, 4096), (2048, 4096), (1024, 8192),  # prefill
 ]
 
 WARMUP_ITERS = 5
@@ -389,158 +241,99 @@ BENCH_ITERS = 20
 
 
 def build_inputs(M, N, device="cuda"):
-    """Build FP8 quantized inputs matching vLLM DeepGEMM conventions."""
     torch.manual_seed(42)
-
     q_bf16 = torch.randn(M, H, D, device=device, dtype=torch.bfloat16)
     k_bf16 = torch.randn(N, D, device=device, dtype=torch.bfloat16)
     weights = torch.randn(M, H, device=device, dtype=torch.float32).abs()
-
-    # Quantize to FP8
     q_fp8 = q_bf16.to(torch.float8_e4m3fn)
     k_fp8, k_scale = cast_to_fp8(k_bf16, (0,), False)
-
-    # Valid range: [0, N) for all rows
     ks = torch.zeros(M, dtype=torch.int32, device=device)
     ke = torch.full((M,), N, dtype=torch.int32, device=device)
-
     return q_fp8, k_fp8, k_scale, weights, ks, ke
 
 
-def _run_kernel(fn, *args, **kwargs):
-    """Time a single kernel invocation."""
-    # Synchronize before timing
+def _time_ms(fn, *args, **kwargs):
     torch.cuda.synchronize()
-    start = time.perf_counter()
+    t0 = time.perf_counter()
     fn(*args, **kwargs)
     torch.cuda.synchronize()
-    end = time.perf_counter()
-    return (end - start) * 1000  # ms
+    return (time.perf_counter() - t0) * 1000
 
 
 def benchmark_shape(M, N):
-    """Run correctness + performance for one shape across all available impls."""
     device = "cuda"
     q_fp8, k_fp8, k_scale, weights, ks, ke = build_inputs(M, N, device)
-
     results = {}
     ref = None
 
     # --- vLLM ---
     if VLLM_AVAILABLE:
         try:
-            out_vllm = vllm_fp8_fp4_mqa_logits(
-                q=(q_fp8, None),
-                kv=(k_fp8, k_scale),
-                weights=weights,
-                cu_seqlen_ks=ks,
-                cu_seqlen_ke=ke,
-                clean_logits=True,
+            out = vllm_fp8_fp4_mqa_logits(
+                q=(q_fp8, None), kv=(k_fp8, k_scale),
+                weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
             )
-            ref = out_vllm
-            # Warmup
+            ref = out
             for _ in range(WARMUP_ITERS):
                 vllm_fp8_fp4_mqa_logits(
                     q=(q_fp8, None), kv=(k_fp8, k_scale),
-                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-                    clean_logits=True,
+                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
                 )
-            torch.cuda.synchronize()
-            # Benchmark
-            times = []
-            for _ in range(BENCH_ITERS):
-                t = _run_kernel(
-                    vllm_fp8_fp4_mqa_logits,
-                    q=(q_fp8, None), kv=(k_fp8, k_scale),
-                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-                    clean_logits=True,
-                )
-                times.append(t)
-            results["vLLM"] = (out_vllm, min(times))
+            times = [_time_ms(vllm_fp8_fp4_mqa_logits,
+                              q=(q_fp8, None), kv=(k_fp8, k_scale),
+                              weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True)
+                     for _ in range(BENCH_ITERS)]
+            results["vLLM"] = (out, min(times))
         except Exception as e:
             print(f"  [SKIP] vLLM: {e}")
 
     # --- FlagGems ---
     if FLAG_GEMS_AVAILABLE:
         try:
-            out_fg = flag_gems_fp8_fp4_mqa_logits(
-                q=(q_fp8, None),
-                kv=(k_fp8, k_scale),
-                weights=weights,
-                cu_seqlen_ks=ks,
-                cu_seqlen_ke=ke,
-                clean_logits=True,
+            out = flag_gems_fp8_fp4_mqa_logits(
+                q=(q_fp8, None), kv=(k_fp8, k_scale),
+                weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
             )
             if ref is None:
-                ref = out_fg
-            # Warmup
+                ref = out
             for _ in range(WARMUP_ITERS):
                 flag_gems_fp8_fp4_mqa_logits(
                     q=(q_fp8, None), kv=(k_fp8, k_scale),
-                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-                    clean_logits=True,
+                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
                 )
-            torch.cuda.synchronize()
-            # Benchmark
-            times = []
-            for _ in range(BENCH_ITERS):
-                t = _run_kernel(
-                    flag_gems_fp8_fp4_mqa_logits,
-                    q=(q_fp8, None), kv=(k_fp8, k_scale),
-                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-                    clean_logits=True,
-                )
-                times.append(t)
-            results["FlagGems"] = (out_fg, min(times))
+            times = [_time_ms(flag_gems_fp8_fp4_mqa_logits,
+                              q=(q_fp8, None), kv=(k_fp8, k_scale),
+                              weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True)
+                     for _ in range(BENCH_ITERS)]
+            results["FlagGems"] = (out, min(times))
         except Exception as e:
             print(f"  [SKIP] FlagGems: {e}")
 
-    # --- TLE (always available, self-contained) ---
-    # Tune once before benchmark
-    tle_cfg = _tune_config(M, N, H, D, q_fp8, k_fp8, k_scale, weights)
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = tle_cfg
-
-    # Run once for correctness
-    out_tle = _tle_fp8_fp4_mqa_logits_launch(
-        q_fp8, k_fp8, k_scale, weights, logits=None,
-        M=M, N=N, H=H, D=D, ks=ks, ke=ke, clean_logits=True,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
-        num_warps=num_warps, num_stages=num_stages,
+    # --- TLE ---
+    out = tle_fp8_fp4_mqa_logits(
+        q=(q_fp8, None), kv=(k_fp8, k_scale),
+        weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
     )
     if ref is None:
-        ref = out_tle
-    # Warmup
+        ref = out
     for _ in range(WARMUP_ITERS):
-        _tle_fp8_fp4_mqa_logits_launch(
-            q_fp8, k_fp8, k_scale, weights, logits=None,
-            M=M, N=N, H=H, D=D, ks=ks, ke=ke, clean_logits=True,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
-            num_warps=num_warps, num_stages=num_stages,
+        tle_fp8_fp4_mqa_logits(
+            q=(q_fp8, None), kv=(k_fp8, k_scale),
+            weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
         )
-    torch.cuda.synchronize()
-    # Benchmark
-    times = []
-    for _ in range(BENCH_ITERS):
-        t = _run_kernel(
-            _tle_fp8_fp4_mqa_logits_launch,
-            q_fp8, k_fp8, k_scale, weights, None,
-            M, N, H, D, ks, ke, True,
-            BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
-        )
-        times.append(t)
-    results["TLE"] = (out_tle, min(times))
+    times = [_time_ms(tle_fp8_fp4_mqa_logits,
+                      q=(q_fp8, None), kv=(k_fp8, k_scale),
+                      weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True)
+             for _ in range(BENCH_ITERS)]
+    results["TLE"] = (out, min(times))
 
-    # --- Correctness ---
+    # --- Correctness vs ref ---
     if ref is not None:
-        for name, (out, _) in results.items():
-            if name == "vLLM" or (ref is not out):
-                max_diff = (ref.float() - out.float()).abs().max().item()
-                # Use relaxed atol for FP8 numerical differences
-                status = "PASS" if max_diff < 1e-1 else "FAIL"
-            else:
-                max_diff = 0.0
-                status = "PASS"
-            results[name] = (out, results[name][1], max_diff, status)
+        for name in list(results.keys()):
+            out, t = results[name]
+            diff = (ref.float() - out.float()).abs().max().item()
+            status = "PASS" if diff < 1e-1 else "FAIL"
+            results[name] = (out, t, diff, status)
 
     return results
 
@@ -548,72 +341,42 @@ def benchmark_shape(M, N):
 def main():
     print("=" * 80)
     print("fp8_fp4_mqa_logits Benchmark: vLLM vs FlagGems vs TLE")
-    print(f"  H={H}, D={D}")
-    print(f"  Warmup iters: {WARMUP_ITERS}, Bench iters: {BENCH_ITERS}")
-    print(f"  TLE candidate configs: {len(_TLE_CANDIDATE_CONFIGS)}, tune iters: {_TLE_TUNE_ITERS}")
+    print(f"  H={H}, D={D}  |  TLE config={_TLE_CONFIG}")
+    print(f"  Warmup={WARMUP_ITERS}, Bench={BENCH_ITERS}")
     print("=" * 80)
 
-    header = f"{'Shape':>10} | {'vLLM (ms)':>10} | {'FlagGems (ms)':>13} | {'TLE (ms)':>10} | {'TLE vs vLLM':>11} | {'TLE vs FG':>10} | {'Correctness':>12}"
+    header = f"{'Shape':>10} | {'vLLM ms':>9} | {'FlagGems ms':>11} | {'TLE ms':>8} | {'vs vLLM':>8} | {'vs FG':>7} | {'Correctness'}"
     print(header)
     print("-" * len(header))
 
-    all_passed = True
-
+    all_ok = True
     for M, N in BENCH_SHAPES:
-        results = benchmark_shape(M, N)
-
-        if not results:
-            print(f"[SKIP] {M}x{N}: No implementations available!")
+        r = benchmark_shape(M, N)
+        if not r:
             continue
 
-        vllm_time = results.get("vLLM", (None, None))[1]
-        fg_time = results.get("FlagGems", (None, None))[1]
-        tle_time = results.get("TLE", (None, None))[1]
+        v_t = r.get("vLLM", (None, None))[1]
+        f_t = r.get("FlagGems", (None, None))[1]
+        t_t = r.get("TLE", (None, None))[1]
 
-        vllm_str = f"{vllm_time:.4f}" if vllm_time else "      N/A"
-        fg_str = f"{fg_time:.4f}" if fg_time else "        N/A"
-        tle_str = f"{tle_time:.4f}" if tle_time else "      N/A"
+        def _s(v): return f"{v:.4f}" if v else "     N/A"
+        vs_v = f"{t_t/v_t:.2f}x" if (t_t and v_t) else "    N/A"
+        vs_f = f"{t_t/f_t:.2f}x" if (t_t and f_t) else "    N/A"
 
-        tle_vs_vllm = ""
-        if tle_time and vllm_time:
-            ratio = tle_time / vllm_time
-            tle_vs_vllm = f"{ratio:.2f}x"
-        else:
-            tle_vs_vllm = "     N/A"
-
-        tle_vs_fg = ""
-        if tle_time and fg_time:
-            ratio = tle_time / fg_time
-            tle_vs_fg = f"{ratio:.2f}x"
-        else:
-            tle_vs_fg = "     N/A"
-
-        # Collect correctness status for all impls
-        correctness_parts = []
+        parts = []
         for name in ["vLLM", "FlagGems", "TLE"]:
-            if name in results and len(results[name]) >= 4:
-                _, _, diff, status = results[name]
-                correctness_parts.append(f"{name}:{status}")
-                if status != "PASS":
-                    all_passed = False
+            e = r.get(name)
+            if e and len(e) >= 4:
+                parts.append(f"{name}:{e[3]}")
+                if e[3] != "PASS":
+                    all_ok = False
+        corr = " ".join(parts)
 
-        correctness_str = " ".join(correctness_parts)
-
-        print(f"{M}x{N:>5} | {vllm_str:>10} | {fg_str:>13} | {tle_str:>10} | {tle_vs_vllm:>11} | {tle_vs_fg:>10} | {correctness_str:>12}")
-
-        # Print detail on failure
-        for name in ["vLLM", "FlagGems", "TLE"]:
-            if name in results and len(results[name]) >= 4:
-                _, _, diff, status = results[name]
-                if status != "PASS":
-                    print(f"  [FAIL] {name}: max_diff = {diff:.4e}")
+        print(f"{M}x{N:>5} | {_s(v_t):>9} | {_s(f_t):>11} | {_s(t_t):>8} | {vs_v:>8} | {vs_f:>7} | {corr}")
 
     print("-" * len(header))
-    if all_passed:
-        print("All correctness checks PASSED.")
-    else:
-        print("Some correctness checks FAILED — see details above.")
-    print("Note: TLE currently matches FlagGems kernel logic — optimization passes to follow.")
+    print("ALL PASSED" if all_ok else "SOME FAILED — see above")
+    print("TLE = zero-optimization baseline (same kernel logic, fixed config).")
     print("=" * 80)
 
 
