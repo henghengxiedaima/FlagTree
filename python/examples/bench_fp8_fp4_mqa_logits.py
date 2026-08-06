@@ -346,11 +346,15 @@ def main():
     print(f"  Warmup={WARMUP_ITERS}, Bench={BENCH_ITERS}")
     print("=" * 80)
 
-    header = f"{'Shape':>10} | {'vLLM ms':>9} | {'FG ms':>8} | {'TLE ms':>8} | {'vLLM faster':>11} | {'FG/TLE':>7} | {'Correctness'}"
-    print(header)
-    print("-" * len(header))
+    # --- Performance ---
+    perf_header = f"{'Shape':>10} | {'vLLM ms':>9} | {'FG ms':>8} | {'TLE ms':>8} | {'TLE/FG':>7}"
+    print("--- Performance ---")
+    print(perf_header)
+    print("-" * len(perf_header))
 
     all_ok = True
+    correctness_rows = []
+
     for M, N in BENCH_SHAPES:
         r = benchmark_shape(M, N)
         if not r:
@@ -361,8 +365,7 @@ def main():
         t_t = r.get("TLE", (None, None))[1]
 
         def _s(v): return f"{v:.4f}" if v else "     N/A"
-        vs_v = f"{t_t/v_t:.1f}x" if (t_t and v_t) else "      N/A"
-        vs_f = f"{f_t/t_t:.2f}x" if (t_t and f_t) else "    N/A"
+        speedup = f"{f_t/t_t:.2f}x" if (t_t and f_t) else "    N/A"
 
         parts = []
         for name in ["vLLM", "FlagGems", "TLE"]:
@@ -371,12 +374,19 @@ def main():
                 parts.append(f"{name}:{e[3]}")
                 if e[3] != "PASS":
                     all_ok = False
-        corr = " ".join(parts)
+        corr = " | ".join(parts)
 
-        print(f"{M}x{N:>5} | {_s(v_t):>9} | {_s(f_t):>11} | {_s(t_t):>8} | {vs_v:>8} | {vs_f:>7} | {corr}")
+        print(f"{M}x{N:>5} | {_s(v_t):>9} | {_s(f_t):>8} | {_s(t_t):>8} | {speedup:>7}")
+        correctness_rows.append((M, N, corr, parts))
 
-    print("-" * len(header))
-    print("ALL PASSED" if all_ok else "SOME FAILED — see above")
+    # --- Correctness ---
+    print(f"\n--- Correctness (ref = {'vLLM' if VLLM_AVAILABLE else 'FlagGems'}) ---")
+    for M, N, corr, parts in correctness_rows:
+        failed = [p for p in parts if "FAIL" in p]
+        flag = "  OK" if not failed else "FAIL: " + ", ".join(failed)
+        print(f"  {M}x{N:<5}  {flag}")
+
+    print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED — see above'}")
     print("FlagGems-ref & TLE share the same kernel — TLE ready for optimization.")
     print("=" * 80)
 
