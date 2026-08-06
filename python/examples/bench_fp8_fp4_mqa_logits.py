@@ -81,34 +81,76 @@ def cast_to_fp8(x, dims, is_scale_transposed=False):
 # TLE Standalone Implementation (self-contained, no flag_gems dependencies)
 # =============================================================================
 
-# Tuned configs: (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages)
-_TLE_CONFIGS = {
-    # decode shapes (small M)
-    "decode": [
-        (64, 128, 1, 4, 2),
-        (128, 64, 1, 4, 2),
-    ],
-    # prefill shapes (larger M)
-    "prefill": [
-        (64, 128, 2, 4, 2),
-        (128, 128, 2, 4, 2),
-        (128, 64, 4, 8, 2),
-    ],
-}
-
 _CLEAN_BLOCK_M = 8
 _CLEAN_BLOCK_N = 128
 
+# Candidate configs for mini auto-tuning: (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages)
+# HEAD_BLOCK can only use divisors of H=64: 1, 2, 4, 8
+_TLE_CANDIDATE_CONFIGS = [
+    # Decode-oriented (small M, large N)
+    (32, 128, 1, 4, 2),
+    (64, 128, 1, 4, 2),
+    (64, 64, 1, 4, 2),
+    # Prefill-oriented — batch more heads per iteration
+    (64, 128, 2, 4, 3),
+    (64, 128, 4, 4, 3),
+    (128, 64, 2, 4, 3),
+    (128, 64, 4, 8, 3),
+    (128, 128, 2, 4, 2),
+    (128, 128, 4, 8, 2),
+    (64, 64, 2, 4, 3),
+]
 
-def _select_config(M, N):
-    """Select kernel config based on problem shape."""
-    if M <= 8:
-        # decode
-        return _TLE_CONFIGS["decode"][0]
-    elif M <= 256:
-        return _TLE_CONFIGS["prefill"][0]
-    else:
-        return _TLE_CONFIGS["prefill"][1]
+_TLE_TUNE_ITERS = 3
+
+
+def _tune_config(M, N, H, D, q_values, k_values, k_scales, weights):
+    """Mini auto-tuner: try candidate configs, return the fastest one."""
+    # Filter configs by problem constraints
+    candidates = []
+    for cfg in _TLE_CANDIDATE_CONFIGS:
+        blk_m, blk_n, hb, nw, ns = cfg
+        if H % hb != 0:
+            continue
+        # BLOCK_M shouldn't be excessively larger than M
+        if blk_m > M * 4 and M > 0:
+            continue
+        candidates.append(cfg)
+
+    if not candidates:
+        return _TLE_CANDIDATE_CONFIGS[0]
+
+    best_cfg = candidates[0]
+    best_time = float("inf")
+
+    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
+
+    for cfg in candidates:
+        blk_m, blk_n, hb, nw, ns = cfg
+        grid = (triton.cdiv(M, blk_m), triton.cdiv(N, blk_n))
+        try:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(_TLE_TUNE_ITERS):
+                _tle_fp8_fp4_mqa_logits_kernel[grid](
+                    q_values, k_values, k_scales, weights, logits,
+                    M, N, H, D,
+                    q_values.stride(0), q_values.stride(1), q_values.stride(2),
+                    k_values.stride(0), k_values.stride(1),
+                    logits.stride(0), logits.stride(1),
+                    weights.stride(0), weights.stride(1),
+                    BLOCK_M=blk_m, BLOCK_N=blk_n, HEAD_BLOCK=hb,
+                    num_warps=nw, num_stages=ns,
+                )
+            torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - t0) / _TLE_TUNE_ITERS
+            if elapsed < best_time:
+                best_time = elapsed
+                best_cfg = cfg
+        except Exception:
+            continue
+
+    return best_cfg
 
 
 @triton.jit
@@ -249,6 +291,37 @@ def _tle_clean_logits_kernel(
     )
 
 
+def _tle_fp8_fp4_mqa_logits_launch(
+    q_values, k_values, k_scales, weights, logits,
+    M, N, H, D, ks, ke, clean_logits,
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
+):
+    """Launch TLE kernel with pre-selected config (no autotuning)."""
+    if logits is None:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _tle_fp8_fp4_mqa_logits_kernel[grid](
+        q_values, k_values, k_scales, weights, logits,
+        M, N, H, D,
+        q_values.stride(0), q_values.stride(1), q_values.stride(2),
+        k_values.stride(0), k_values.stride(1),
+        logits.stride(0), logits.stride(1),
+        weights.stride(0), weights.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    if clean_logits:
+        clean_grid = (triton.cdiv(M, _CLEAN_BLOCK_M), triton.cdiv(N, _CLEAN_BLOCK_N))
+        _tle_clean_logits_kernel[clean_grid](
+            logits, ks, ke, M, N, logits.stride(0), logits.stride(1),
+            BLOCK_M=_CLEAN_BLOCK_M, BLOCK_N=_CLEAN_BLOCK_N,
+        )
+
+    return logits
+
+
 def tle_fp8_fp4_mqa_logits(
     q: tuple,
     kv: tuple,
@@ -278,59 +351,14 @@ def tle_fp8_fp4_mqa_logits(
     M, H, D = q_values.shape
     N = k_values.shape[0]
 
-    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _tune_config(
+        M, N, H, D, q_values, k_values, k_scales, weights)
 
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _select_config(M, N)
-
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
+    return _tle_fp8_fp4_mqa_logits_launch(
+        q_values, k_values, k_scales, weights, None,
+        M, N, H, D, cu_seqlen_ks, cu_seqlen_ke, clean_logits,
+        BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
     )
-
-    _tle_fp8_fp4_mqa_logits_kernel[grid](
-        q_values,
-        k_values,
-        k_scales,
-        weights,
-        logits,
-        M,
-        N,
-        H,
-        D,
-        q_values.stride(0),
-        q_values.stride(1),
-        q_values.stride(2),
-        k_values.stride(0),
-        k_values.stride(1),
-        logits.stride(0),
-        logits.stride(1),
-        weights.stride(0),
-        weights.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        HEAD_BLOCK=HEAD_BLOCK,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-
-    if clean_logits:
-        clean_grid = (
-            triton.cdiv(M, _CLEAN_BLOCK_M),
-            triton.cdiv(N, _CLEAN_BLOCK_N),
-        )
-        _tle_clean_logits_kernel[clean_grid](
-            logits,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            M,
-            N,
-            logits.stride(0),
-            logits.stride(1),
-            BLOCK_M=_CLEAN_BLOCK_M,
-            BLOCK_N=_CLEAN_BLOCK_N,
-        )
-
-    return logits
 
 
 # =============================================================================
@@ -468,32 +496,36 @@ def benchmark_shape(M, N):
             print(f"  [SKIP] FlagGems: {e}")
 
     # --- TLE (always available, self-contained) ---
-    out_tle = tle_fp8_fp4_mqa_logits(
-        q=(q_fp8, None),
-        kv=(k_fp8, k_scale),
-        weights=weights,
-        cu_seqlen_ks=ks,
-        cu_seqlen_ke=ke,
-        clean_logits=True,
+    # Tune once before benchmark
+    tle_cfg = _tune_config(M, N, H, D, q_fp8, k_fp8, k_scale, weights)
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = tle_cfg
+
+    # Run once for correctness
+    out_tle = _tle_fp8_fp4_mqa_logits_launch(
+        q_fp8, k_fp8, k_scale, weights, logits=None,
+        M=M, N=N, H=H, D=D, ks=ks, ke=ke, clean_logits=True,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
+        num_warps=num_warps, num_stages=num_stages,
     )
     if ref is None:
         ref = out_tle
     # Warmup
     for _ in range(WARMUP_ITERS):
-        tle_fp8_fp4_mqa_logits(
-            q=(q_fp8, None), kv=(k_fp8, k_scale),
-            weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-            clean_logits=True,
+        _tle_fp8_fp4_mqa_logits_launch(
+            q_fp8, k_fp8, k_scale, weights, logits=None,
+            M=M, N=N, H=H, D=D, ks=ks, ke=ke, clean_logits=True,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
+            num_warps=num_warps, num_stages=num_stages,
         )
     torch.cuda.synchronize()
     # Benchmark
     times = []
     for _ in range(BENCH_ITERS):
         t = _run_kernel(
-            tle_fp8_fp4_mqa_logits,
-            q=(q_fp8, None), kv=(k_fp8, k_scale),
-            weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke,
-            clean_logits=True,
+            _tle_fp8_fp4_mqa_logits_launch,
+            q_fp8, k_fp8, k_scale, weights, None,
+            M, N, H, D, ks, ke, True,
+            BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages,
         )
         times.append(t)
     results["TLE"] = (out_tle, min(times))
@@ -518,54 +550,69 @@ def main():
     print("fp8_fp4_mqa_logits Benchmark: vLLM vs FlagGems vs TLE")
     print(f"  H={H}, D={D}")
     print(f"  Warmup iters: {WARMUP_ITERS}, Bench iters: {BENCH_ITERS}")
+    print(f"  TLE candidate configs: {len(_TLE_CANDIDATE_CONFIGS)}, tune iters: {_TLE_TUNE_ITERS}")
     print("=" * 80)
 
-    header = f"{'Shape':>12}  {'vLLM (ms)':>10}  {'FlagGems (ms)':>13}  {'TLE (ms)':>10}  {'TLE vs vLLM':>12}  {'TLE vs FG':>10}"
+    header = f"{'Shape':>10} | {'vLLM (ms)':>10} | {'FlagGems (ms)':>13} | {'TLE (ms)':>10} | {'TLE vs vLLM':>11} | {'TLE vs FG':>10} | {'Correctness':>12}"
     print(header)
     print("-" * len(header))
 
+    all_passed = True
+
     for M, N in BENCH_SHAPES:
-        print(f"\n[{M}x{N}]", end="", flush=True)
         results = benchmark_shape(M, N)
 
         if not results:
-            print("  No implementations available!")
+            print(f"[SKIP] {M}x{N}: No implementations available!")
             continue
 
-        # Print results
         vllm_time = results.get("vLLM", (None, None))[1]
         fg_time = results.get("FlagGems", (None, None))[1]
         tle_time = results.get("TLE", (None, None))[1]
 
-        vllm_str = f"{vllm_time:.4f}" if vllm_time else "N/A"
-        fg_str = f"{fg_time:.4f}" if fg_time else "N/A"
-        tle_str = f"{tle_time:.4f}" if tle_time else "N/A"
+        vllm_str = f"{vllm_time:.4f}" if vllm_time else "      N/A"
+        fg_str = f"{fg_time:.4f}" if fg_time else "        N/A"
+        tle_str = f"{tle_time:.4f}" if tle_time else "      N/A"
 
         tle_vs_vllm = ""
         if tle_time and vllm_time:
             ratio = tle_time / vllm_time
             tle_vs_vllm = f"{ratio:.2f}x"
         else:
-            tle_vs_vllm = "N/A"
+            tle_vs_vllm = "     N/A"
 
         tle_vs_fg = ""
         if tle_time and fg_time:
             ratio = tle_time / fg_time
             tle_vs_fg = f"{ratio:.2f}x"
         else:
-            tle_vs_fg = "N/A"
+            tle_vs_fg = "     N/A"
 
-        print(f"\r{'':>12}  {vllm_str:>10}  {fg_str:>13}  {tle_str:>10}  {tle_vs_vllm:>12}  {tle_vs_fg:>10}")
-
-        # Correctness summary
+        # Collect correctness status for all impls
+        correctness_parts = []
         for name in ["vLLM", "FlagGems", "TLE"]:
-            if name in results:
+            if name in results and len(results[name]) >= 4:
+                _, _, diff, status = results[name]
+                correctness_parts.append(f"{name}:{status}")
+                if status != "PASS":
+                    all_passed = False
+
+        correctness_str = " ".join(correctness_parts)
+
+        print(f"{M}x{N:>5} | {vllm_str:>10} | {fg_str:>13} | {tle_str:>10} | {tle_vs_vllm:>11} | {tle_vs_fg:>10} | {correctness_str:>12}")
+
+        # Print detail on failure
+        for name in ["vLLM", "FlagGems", "TLE"]:
+            if name in results and len(results[name]) >= 4:
                 _, _, diff, status = results[name]
                 if status != "PASS":
-                    print(f"  [CORRECTNESS] {name}: {status} (max_diff={diff:.2e})")
+                    print(f"  [FAIL] {name}: max_diff = {diff:.4e}")
 
-    print("\n" + "=" * 80)
-    print("Done.")
+    print("-" * len(header))
+    if all_passed:
+        print("All correctness checks PASSED.")
+    else:
+        print("Some correctness checks FAILED — see details above.")
     print("Note: TLE currently matches FlagGems kernel logic — optimization passes to follow.")
     print("=" * 80)
 
