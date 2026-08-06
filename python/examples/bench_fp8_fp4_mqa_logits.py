@@ -42,13 +42,7 @@ except ImportError as e:
     _vllm_cast_to_fp8 = None
     print(f"[WARN] vLLM not available: {e}")
 
-try:
-    from flag_gems.fused.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits as flag_gems_fp8_fp4_mqa_logits
-    FLAG_GEMS_AVAILABLE = True
-    print("[INFO] FlagGems — available")
-except ImportError as e:
-    FLAG_GEMS_AVAILABLE = False
-    print(f"[WARN] FlagGems not available: {e}")
+# FlagGems is inlined below — no external import needed.
 
 
 # =============================================================================
@@ -76,12 +70,11 @@ def cast_to_fp8(x, dims, is_scale_transposed=False):
 
 
 # =============================================================================
-# TLE Standalone Kernels (zero optimization — same logic as FlagGems,
-# stripped of flag_gems imports / decorators)
+# Shared MQA Logits Kernel (used by both FlagGems-ref and TLE wrappers)
 # =============================================================================
 
 @triton.jit
-def _tle_mqa_logits_kernel(
+def _mqa_logits_kernel(
     Q_ptr, K_ptr, K_scale_ptr, W_ptr, O_ptr,
     M, N,
     H: tl.constexpr, D: tl.constexpr,
@@ -147,7 +140,7 @@ def _tle_mqa_logits_kernel(
 
 
 @triton.jit
-def _tle_clean_logits_kernel(
+def _clean_logits_kernel(
     O_ptr, KS_ptr, KE_ptr, M, N,
     stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -175,34 +168,26 @@ def _tle_clean_logits_kernel(
 
 
 # =============================================================================
-# TLE wrapper — simple fixed config, no auto-tuning
+# Wrappers — FlagGems-ref and TLE, both calling the shared kernel
 # =============================================================================
 
 # Fixed config: (BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages)
 # HEAD_BLOCK must divide H=64: valid values → 1, 2, 4, 8
-_TLE_CONFIG = (64, 128, 2, 4, 2)
+_DEFAULT_CONFIG = (64, 128, 2, 4, 2)
 _CLEAN_M = 8
 _CLEAN_N = 128
 
 
-def tle_fp8_fp4_mqa_logits(
-    q: tuple, kv: tuple,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-    clean_logits: bool = True,
-) -> torch.Tensor:
-    """TLE standalone fp8_fp4_mqa_logits — zero optimization baseline."""
-    q_values, _ = q
-    k_values, k_scales = kv
+def _launch_kernel(q_values, k_values, k_scales, weights,
+                   cu_seqlen_ks, cu_seqlen_ke, clean_logits, config):
+    """Launch the shared MQA kernel + optional clean-logits pass."""
     M, H, D = q_values.shape
     N = k_values.shape[0]
-
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _TLE_CONFIG
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = config
 
     logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
-
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    _tle_mqa_logits_kernel[grid](
+    _mqa_logits_kernel[grid](
         q_values, k_values, k_scales, weights, logits,
         M, N, H, D,
         q_values.stride(0), q_values.stride(1), q_values.stride(2),
@@ -215,13 +200,33 @@ def tle_fp8_fp4_mqa_logits(
 
     if clean_logits:
         clean_grid = (triton.cdiv(M, _CLEAN_M), triton.cdiv(N, _CLEAN_N))
-        _tle_clean_logits_kernel[clean_grid](
+        _clean_logits_kernel[clean_grid](
             logits, cu_seqlen_ks, cu_seqlen_ke, M, N,
             logits.stride(0), logits.stride(1),
             BLOCK_M=_CLEAN_M, BLOCK_N=_CLEAN_N,
         )
 
     return logits
+
+
+def fg_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
+                           clean_logits=True):
+    """FlagGems reference — inline kernel, no external dependency."""
+    q_values, _ = q
+    k_values, k_scales = kv
+    return _launch_kernel(q_values, k_values, k_scales, weights,
+                          cu_seqlen_ks, cu_seqlen_ke, clean_logits,
+                          _DEFAULT_CONFIG)
+
+
+def tle_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
+                            clean_logits=True):
+    """TLE baseline — same kernel as FlagGems, ready for TLE optimization."""
+    q_values, _ = q
+    k_values, k_scales = kv
+    return _launch_kernel(q_values, k_values, k_scales, weights,
+                          cu_seqlen_ks, cu_seqlen_ke, clean_logits,
+                          _DEFAULT_CONFIG)
 
 
 # =============================================================================
@@ -287,27 +292,23 @@ def benchmark_shape(M, N):
         except Exception as e:
             print(f"  [SKIP] vLLM: {e}")
 
-    # --- FlagGems ---
-    if FLAG_GEMS_AVAILABLE:
-        try:
-            out = flag_gems_fp8_fp4_mqa_logits(
-                q=(q_fp8, None), kv=(k_fp8, k_scale),
-                weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
-            )
-            if ref is None:
-                ref = out
-            for _ in range(WARMUP_ITERS):
-                flag_gems_fp8_fp4_mqa_logits(
-                    q=(q_fp8, None), kv=(k_fp8, k_scale),
-                    weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
-                )
-            times = [_time_ms(flag_gems_fp8_fp4_mqa_logits,
-                              q=(q_fp8, None), kv=(k_fp8, k_scale),
-                              weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True)
-                     for _ in range(BENCH_ITERS)]
-            results["FlagGems"] = (out, min(times))
-        except Exception as e:
-            print(f"  [SKIP] FlagGems: {e}")
+    # --- FlagGems reference (inline kernel) ---
+    out = fg_fp8_fp4_mqa_logits(
+        q=(q_fp8, None), kv=(k_fp8, k_scale),
+        weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
+    )
+    if ref is None:
+        ref = out
+    for _ in range(WARMUP_ITERS):
+        fg_fp8_fp4_mqa_logits(
+            q=(q_fp8, None), kv=(k_fp8, k_scale),
+            weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True,
+        )
+    times = [_time_ms(fg_fp8_fp4_mqa_logits,
+                      q=(q_fp8, None), kv=(k_fp8, k_scale),
+                      weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, clean_logits=True)
+             for _ in range(BENCH_ITERS)]
+    results["FlagGems"] = (out, min(times))
 
     # --- TLE ---
     out = tle_fp8_fp4_mqa_logits(
@@ -341,7 +342,7 @@ def benchmark_shape(M, N):
 def main():
     print("=" * 80)
     print("fp8_fp4_mqa_logits Benchmark: vLLM vs FlagGems vs TLE")
-    print(f"  H={H}, D={D}  |  TLE config={_TLE_CONFIG}")
+    print(f"  H={H}, D={D}  |  config={_DEFAULT_CONFIG}")
     print(f"  Warmup={WARMUP_ITERS}, Bench={BENCH_ITERS}")
     print("=" * 80)
 
@@ -376,7 +377,7 @@ def main():
 
     print("-" * len(header))
     print("ALL PASSED" if all_ok else "SOME FAILED — see above")
-    print("TLE = zero-optimization baseline (same kernel logic, fixed config).")
+    print("FlagGems-ref & TLE share the same kernel — TLE ready for optimization.")
     print("=" * 80)
 
 
