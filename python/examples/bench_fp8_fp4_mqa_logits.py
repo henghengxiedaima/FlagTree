@@ -27,7 +27,6 @@ import time
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
 
 # =============================================================================
 # Imports with graceful fallback
@@ -169,96 +168,7 @@ def _clean_logits_kernel(
 
 
 # =============================================================================
-# TLE Step 1: fused clean-logits kernel (WGMMA pending — see notes below)
-#
-# WGMMA requires the b operand (K) in shared memory with proper MMA-friendly
-# layout. For fp8 WGMMA, the shared-memory staging path differs from fp16:
-#   - FP8 WGMMA shared-memory layout may need TMA-based staging.
-#   - Manual tl.load→tl.store to fp8 smem may not lower correctly.
-# Refer to existing WGMMA examples in python/tutorials/tle/ and
-# python/test/tle/integration/ for validated patterns.
-# =============================================================================
-
-@triton.jit
-def _tle_mqa_logits_kernel(
-    Q_ptr, K_ptr, K_scale_ptr, W_ptr, O_ptr,
-    KS_ptr, KE_ptr,
-    M, N,
-    H: tl.constexpr, D: tl.constexpr,
-    stride_qm, stride_qh, stride_qd,
-    stride_kn, stride_kd,
-    stride_om, stride_on,
-    stride_wm, stride_wh,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_BLOCK: tl.constexpr,
-    CLEAN_LOGITS: tl.constexpr,
-):
-    """TLE fused MQA logits — clean-logits inlined into main kernel.
-
-    logits[m,n] = sum_h(ReLU(sum_d(q[m,h,d]*k[n,d]) * k_scale[n]) * weights[m,h])
-    Invalid positions (n < ks[m] or n >= ke[m]) are filled with -inf in-place.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    d_offs = tl.arange(0, D)
-
-    m_mask = m_offs < M
-    n_mask = n_offs < N
-
-    k = tl.load(
-        K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
-        mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0,
-    )
-    k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
-
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for hb in range(0, H, HEAD_BLOCK):
-        hb_offs = hb + tl.arange(0, HEAD_BLOCK)
-
-        q = tl.load(
-            Q_ptr + m_offs[:, None, None] * stride_qm
-                  + hb_offs[None, :, None] * stride_qh
-                  + d_offs[None, None, :] * stride_qd,
-            mask=m_mask[:, None, None]
-                 & (hb_offs[None, :, None] < H)
-                 & (d_offs[None, None, :] < D),
-            other=0.0,
-        )
-
-        q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
-        dot = tl.dot(q_2d, tl.trans(k))
-        dot = tl.maximum(dot * k_scale[None, :], 0.0)
-
-        w = tl.load(
-            W_ptr + m_offs[:, None] * stride_wm + hb_offs[None, :] * stride_wh,
-            mask=m_mask[:, None] & (hb_offs[None, :] < H), other=0.0,
-        )
-        w_flat = tl.reshape(w, [BLOCK_M * HEAD_BLOCK])
-        dot = dot * w_flat[:, None]
-
-        dot_3d = tl.reshape(dot, [BLOCK_M, HEAD_BLOCK, BLOCK_N])
-        acc += tl.sum(dot_3d, axis=1)
-
-    out_ptrs = O_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
-    base_mask = m_mask[:, None] & n_mask[None, :]
-
-    if CLEAN_LOGITS:
-        ks = tl.load(KS_ptr + m_offs, mask=m_mask, other=0)
-        ke = tl.load(KE_ptr + m_offs, mask=m_mask, other=0)
-        invalid = (n_offs[None, :] < ks[:, None]) | (n_offs[None, :] >= ke[:, None])
-        neg_inf = float("-inf")
-        tl.store(out_ptrs, neg_inf + tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32),
-                 mask=base_mask & invalid)
-        tl.store(out_ptrs, acc, mask=base_mask & ~invalid)
-    else:
-        tl.store(out_ptrs, acc, mask=base_mask)
-
-
-# =============================================================================
-# Wrappers — FlagGems-ref (baseline) and TLE (optimized)
+# Wrappers — FlagGems-ref and TLE, both calling the shared kernels
 # =============================================================================
 
 _DEFAULT_CONFIG = (64, 128, 2, 4, 2)
@@ -266,14 +176,12 @@ _CLEAN_M = 8
 _CLEAN_N = 128
 
 
-def fg_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
-                           clean_logits=True):
-    """FlagGems reference — original two-kernel implementation."""
-    q_values, _ = q
-    k_values, k_scales = kv
+def _launch_kernel(q_values, k_values, k_scales, weights,
+                   cu_seqlen_ks, cu_seqlen_ke, clean_logits, config):
+    """Launch the shared MQA kernel + optional clean-logits pass."""
     M, H, D = q_values.shape
     N = k_values.shape[0]
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _DEFAULT_CONFIG
+    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = config
 
     logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
@@ -299,31 +207,24 @@ def fg_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
     return logits
 
 
-def tle_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
-                            clean_logits=True):
-    """TLE Step 1 — fused clean-logits (single kernel, no second pass)."""
+def fg_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
+                           clean_logits=True):
+    """FlagGems reference — inline kernel, no external dependency."""
     q_values, _ = q
     k_values, k_scales = kv
-    M, H, D = q_values.shape
-    N = k_values.shape[0]
-    BLOCK_M, BLOCK_N, HEAD_BLOCK, num_warps, num_stages = _DEFAULT_CONFIG
+    return _launch_kernel(q_values, k_values, k_scales, weights,
+                          cu_seqlen_ks, cu_seqlen_ke, clean_logits,
+                          _DEFAULT_CONFIG)
 
-    logits = torch.empty((M, N), dtype=torch.float32, device=q_values.device)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    _tle_mqa_logits_kernel[grid](
-        q_values, k_values, k_scales, weights, logits,
-        cu_seqlen_ks, cu_seqlen_ke,
-        M, N, H, D,
-        q_values.stride(0), q_values.stride(1), q_values.stride(2),
-        k_values.stride(0), k_values.stride(1),
-        logits.stride(0), logits.stride(1),
-        weights.stride(0), weights.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_BLOCK=HEAD_BLOCK,
-        CLEAN_LOGITS=clean_logits,
-        num_warps=num_warps, num_stages=num_stages,
-    )
 
-    return logits
+def tle_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
+                            clean_logits=True):
+    """TLE baseline — same kernel as FlagGems, ready for TLE optimization."""
+    q_values, _ = q
+    k_values, k_scales = kv
+    return _launch_kernel(q_values, k_values, k_scales, weights,
+                          cu_seqlen_ks, cu_seqlen_ke, clean_logits,
+                          _DEFAULT_CONFIG)
 
 
 # =============================================================================
@@ -484,7 +385,7 @@ def main():
         print(f"  {M}x{N:<5}  {flag}")
 
     print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED — see above'}")
-    print("FlagGems-ref = original two-kernel | TLE Step 1 = fused clean-logits")
+    print("FlagGems-ref & TLE share the same kernel — TLE ready for optimization.")
     print("=" * 80)
 
 
