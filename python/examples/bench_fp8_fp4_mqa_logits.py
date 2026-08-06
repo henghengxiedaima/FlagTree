@@ -169,10 +169,14 @@ def _clean_logits_kernel(
 
 
 # =============================================================================
-# TLE Step 2: WGMMA + fused clean-logits
-#   - K staged into shared memory, reused across head batches via WGMMA
-#   - Clean-logits fused into final store
-#   - M must be divisible by 64 (WGMMA constraint: M ≥ 64, M % 64 == 0)
+# TLE Step 1: fused clean-logits kernel (WGMMA pending — see notes below)
+#
+# WGMMA requires the b operand (K) in shared memory with proper MMA-friendly
+# layout. For fp8 WGMMA, the shared-memory staging path differs from fp16:
+#   - FP8 WGMMA shared-memory layout may need TMA-based staging.
+#   - Manual tl.load→tl.store to fp8 smem may not lower correctly.
+# Refer to existing WGMMA examples in python/tutorials/tle/ and
+# python/test/tle/integration/ for validated patterns.
 # =============================================================================
 
 @triton.jit
@@ -188,9 +192,10 @@ def _tle_mqa_logits_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_BLOCK: tl.constexpr,
     CLEAN_LOGITS: tl.constexpr,
 ):
-    """TLE WGMMA MQA logits — async warp-group MMA with fused clean-logits.
+    """TLE fused MQA logits — clean-logits inlined into main kernel.
 
     logits[m,n] = sum_h(ReLU(sum_d(q[m,h,d]*k[n,d]) * k_scale[n]) * weights[m,h])
+    Invalid positions (n < ks[m] or n >= ke[m]) are filled with -inf in-place.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -202,14 +207,10 @@ def _tle_mqa_logits_kernel(
     m_mask = m_offs < M
     n_mask = n_offs < N
 
-    # Stage K into shared memory for WGMMA (b must be an smem buffered_tensor)
-    k_smem = tle.gpu.alloc([BLOCK_N, D], dtype=tl.float8e4nv, scope=tle.gpu.smem)
-    k_reg = tl.load(
+    k = tl.load(
         K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
         mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0,
     )
-    tl.store(tle.gpu.local_ptr(k_smem), k_reg)
-
     k_scale = tl.load(K_scale_ptr + n_offs, mask=n_mask, other=0.0)
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -228,11 +229,7 @@ def _tle_mqa_logits_kernel(
         )
 
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
-
-        # Async Hopper WGMMA: q_2d (fp8 reg) @ k_smem (fp8 smem) → fp32
-        dot = tle.gpu.wgmma(q_2d, k_smem, out_dtype=tl.float32)
-        dot = tle.gpu.wgmma_wait(dot)
-
+        dot = tl.dot(q_2d, tl.trans(k))
         dot = tl.maximum(dot * k_scale[None, :], 0.0)
 
         w = tl.load(
@@ -304,7 +301,7 @@ def fg_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
 
 def tle_fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
                             clean_logits=True):
-    """TLE Step 2 — WGMMA + fused clean-logits."""
+    """TLE Step 1 — fused clean-logits (single kernel, no second pass)."""
     q_values, _ = q
     k_values, k_scales = kv
     M, H, D = q_values.shape
@@ -487,7 +484,7 @@ def main():
         print(f"  {M}x{N:<5}  {flag}")
 
     print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED — see above'}")
-    print("FlagGems-ref = original tl.dot | TLE Step 2 = WGMMA + fused clean-logits")
+    print("FlagGems-ref = original two-kernel | TLE Step 1 = fused clean-logits")
     print("=" * 80)
 
 
