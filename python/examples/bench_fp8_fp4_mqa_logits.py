@@ -346,7 +346,7 @@ def main():
     print(f"  Warmup={WARMUP_ITERS}, Bench={BENCH_ITERS}")
     print("=" * 80)
 
-    header = f"{'Shape':>10} | {'vLLM ms':>9} | {'FlagGems ms':>11} | {'TLE ms':>8} | {'vs vLLM':>8} | {'vs FG':>7} | {'Correctness'}"
+    header = f"{'Shape':>10} | {'vLLM ms':>9} | {'FG ms':>8} | {'TLE ms':>8} | {'vLLM faster':>11} | {'FG/TLE':>7} | {'Correctness'}"
     print(header)
     print("-" * len(header))
 
@@ -361,8 +361,8 @@ def main():
         t_t = r.get("TLE", (None, None))[1]
 
         def _s(v): return f"{v:.4f}" if v else "     N/A"
-        vs_v = f"{t_t/v_t:.2f}x" if (t_t and v_t) else "    N/A"
-        vs_f = f"{t_t/f_t:.2f}x" if (t_t and f_t) else "    N/A"
+        vs_v = f"{t_t/v_t:.1f}x" if (t_t and v_t) else "      N/A"
+        vs_f = f"{f_t/t_t:.2f}x" if (t_t and f_t) else "    N/A"
 
         parts = []
         for name in ["vLLM", "FlagGems", "TLE"]:
