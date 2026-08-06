@@ -203,7 +203,7 @@ def _tle_mqa_logits_kernel(
     n_mask = n_offs < N
 
     # Stage K into shared memory for WGMMA (b must be an smem buffered_tensor)
-    k_smem = tle.gpu.alloc([BLOCK_N, D], dtype=tl.float8e4, scope=tle.gpu.smem)
+    k_smem = tle.gpu.alloc([BLOCK_N, D], dtype=tl.float8e4nv, scope=tle.gpu.smem)
     k_reg = tl.load(
         K_ptr + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
         mask=n_mask[:, None] & (d_offs[None, :] < D), other=0.0,
