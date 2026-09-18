@@ -142,9 +142,9 @@ def dump_ttir(path):
 
 def run_check(M=64, N=64, K=64):
     torch.manual_seed(0)
-    a = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-    c = torch.empty((M, N), device="cuda", dtype=torch.float32)
+    a = torch.randn((M, K), device="gcu", dtype=torch.float16)
+    b = torch.randn((K, N), device="gcu", dtype=torch.float16)
+    c = torch.empty((M, N), device="gcu", dtype=torch.float32)
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 16))
     _matmul_gpu_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
                              c.stride(1), BLOCK_M=16, BLOCK_N=16, BLOCK_K=16)
