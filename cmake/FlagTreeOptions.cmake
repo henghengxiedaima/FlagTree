@@ -31,9 +31,9 @@ macro(flagtree_configure_options)
   # build contract as a C/C++ macro without introducing a CMake cache option.
   set(FLAGTREE_COMMON_IR_ENABLED "$ENV{FLAGTREE_COMMON_IR}")
   if(FLAGTREE_COMMON_IR_ENABLED)
-    if(FLAGTREE_BACKEND)
-      message(FATAL_ERROR "FLAGTREE_COMMON_IR requires the default NVIDIA backend")
-    endif()
+    #if(FLAGTREE_BACKEND)
+    #  message(FATAL_ERROR "FLAGTREE_COMMON_IR requires the default NVIDIA backend")
+    #endif()
     add_compile_definitions(FLAGTREE_COMMON_IR)
   endif()
 
@@ -613,6 +613,8 @@ function(flagtree_add_tle_generated_header_dependencies)
       TritonNVIDIAGPUToLLVM
       TritonGPUToLLVM
       NVHopperTransforms
+      TritonHCUAnalysis
+      TritonHCUGPUToLLVM
       ${_flagtree_enflame_tle_header_targets}
       triton
       triton-opt

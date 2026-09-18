@@ -48,6 +48,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endif()
   endif()
 
+  if(FLAGTREE_COMMON_IR_ENABLED AND TARGET CommonIRIR)
+    add_subdirectory(include/CommonIRToTTGIR)
+    add_subdirectory(lib/CommonIRToTTGIR)
+  endif()
+
   add_triton_plugin(TritonTLE
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_tle.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_tle_raw.cc
@@ -60,6 +65,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
     )
 
   target_link_libraries(TritonTLE PRIVATE Python3::Module pybind11::headers MLIRTargetLLVMIRImport)
+  if(FLAGTREE_COMMON_IR_ENABLED AND TARGET TleCommonIRToTTGIR)
+    target_link_libraries(TritonTLE PRIVATE TleCommonIRToTTGIR)
+  endif()
   add_dependencies(TritonTLE
     TleTableGen
     TritonTLETransformsIncGen

@@ -27,6 +27,7 @@
 #ifdef FLAGTREE_COMMON_IR
 #include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "CommonIRToTTGIR/Passes.h"
 #endif
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
@@ -1098,6 +1099,13 @@ void init_triton_tle_passes(py::module &&m) {
                      tle::createTritonTleLowerInsertTile);
 }
 
+#ifdef FLAGTREE_COMMON_IR
+void init_triton_tle_passes_commonir(py::module &&m) {
+  ADD_PASS_OPTION_WRAPPER_1("add_to_ttgir",
+                            mlir::triton::createTleCommonIRToTTGIR, bool);
+}
+#endif
+
 void init_tle_raw_ir(py::module &&m) {
   using ret = py::return_value_policy;
 
@@ -1193,6 +1201,9 @@ void init_triton_tle(py::module &&m) {
   init_triton_tle_utils(m.def_submodule("utils"));
   init_triton_tle_ir(m.def_submodule("ir"));
   init_triton_tle_passes(m.def_submodule("passes"));
+#ifdef FLAGTREE_COMMON_IR
+  init_triton_tle_passes_commonir(m.def_submodule("passes").def_submodule("commonir"));
+#endif
   init_tle_raw_ir(m.def_submodule("raw_ir"));
   init_tle_raw_passes(m.def_submodule("raw_passes"));
   init_llvm(m.def_submodule("llvm"));
