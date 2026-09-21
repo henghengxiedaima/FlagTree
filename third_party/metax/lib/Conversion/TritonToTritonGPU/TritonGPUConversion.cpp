@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 
 #include <algorithm>
@@ -92,13 +91,9 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
                scf::ReduceReturnOp>();
 
 #ifdef __MCTLE__
-  // [metax+CommonIR] FLAGTREE_COMMONIR_RELAX_LOCAL 置位时跳过 local 收紧,
-  // 让通用 CommonIRToTTGIR 产出的无编码 ttg.local_* 穿过 convert,交下游补编码。
-  if (!getenv("FLAGTREE_COMMONIR_RELAX_LOCAL")) {
-    addDynamicallyLegalOp<triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp,
-                          triton::gpu::LocalLoadOp>(
-        [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
-  }
+  addDynamicallyLegalOp<triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp,
+                        triton::gpu::LocalLoadOp>(
+      [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
 #endif
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,

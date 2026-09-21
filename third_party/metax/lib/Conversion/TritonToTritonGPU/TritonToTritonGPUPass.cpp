@@ -942,6 +942,13 @@ public:
     populateTileRawPatterns(typeConverter, patterns);
 #endif
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
+#ifdef FLAGTREE_COMMON_IR
+    // [metax+CommonIR] CommonIRToTTGIR 在 make_ttir 产出无编码 ttg.local_load/store;
+    // 给它们 GenericOpPattern,让 TypeConverter 补 blocked 编码(仅在已编码时动态合法)。
+    patterns.insert<GenericOpPattern<mlir::triton::gpu::LocalLoadOp>,
+                    GenericOpPattern<mlir::triton::gpu::LocalStoreOp>>(
+        typeConverter, context);
+#endif
 
     Builder b(&getContext());
     mod->setAttr(AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
