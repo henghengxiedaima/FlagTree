@@ -3,9 +3,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # [metax+CommonIR] 瘦身路径：只编 triton_tle_commonir.cc（CommonIR builder 方法），
 # 只链 flir 的 CommonIRIR，跳过整套 TLE-raw/Lite（dialect/utils/Transforms/Analysis/TleToLLVM/raw）。
-message(STATUS "[SLIM-TLE-CHECK] be=${FLAGTREE_BACKEND} env_be=$ENV{FLAGTREE_BACKEND} cir=${FLAGTREE_COMMON_IR_ENABLED} env_cir=$ENV{FLAGTREE_COMMON_IR} pym=${TRITON_BUILD_PYTHON_MODULE}")
 if("$ENV{FLAGTREE_BACKEND}" STREQUAL "metax" AND (NOT "$ENV{FLAGTREE_COMMON_IR}" STREQUAL "") AND TRITON_BUILD_PYTHON_MODULE)
-  message(WARNING "[SLIM-TLE] building CommonIR-only slim tle (triton_tle_commonir.cc)")
+  message(STATUS "[tle] metax+CommonIR: building CommonIR-only tle binding")
   set(_slim_common_ir_libs "")
   if(TARGET CommonIRIR)
     list(APPEND _slim_common_ir_libs CommonIRIR)
@@ -111,7 +110,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   endif()
   add_dependencies(TritonTLE
     TleTableGen
-    TleTransformsIncGen
+    TritonTLETransformsIncGen
     TritonGPUTableGen
     TritonGPUAttrDefsIncGen
     ${TLE_TRITON_GPU_ATTR_DEPENDS}
