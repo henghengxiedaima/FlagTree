@@ -1,6 +1,47 @@
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# [metax+CommonIR] 瘦身路径：只编 triton_tle_commonir.cc（CommonIR builder 方法），
+# 只链 flir 的 CommonIRIR，跳过整套 TLE-raw/Lite（dialect/utils/Transforms/Analysis/TleToLLVM/raw）。
+message(STATUS "[SLIM-TLE-CHECK] be=${FLAGTREE_BACKEND} env_be=$ENV{FLAGTREE_BACKEND} cir=${FLAGTREE_COMMON_IR_ENABLED} env_cir=$ENV{FLAGTREE_COMMON_IR} pym=${TRITON_BUILD_PYTHON_MODULE}")
+if("$ENV{FLAGTREE_BACKEND}" STREQUAL "metax" AND (NOT "$ENV{FLAGTREE_COMMON_IR}" STREQUAL "") AND TRITON_BUILD_PYTHON_MODULE)
+  message(WARNING "[SLIM-TLE] building CommonIR-only slim tle (triton_tle_commonir.cc)")
+  set(_slim_common_ir_libs "")
+  if(TARGET CommonIRIR)
+    list(APPEND _slim_common_ir_libs CommonIRIR)
+  endif()
+  # [metax+CommonIR] 编译并链接通用 CommonIRToTTGIR(仅 Arith/CommonIRIR/TritonIR/TritonGPUIR,无 Hopper)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+  include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
+  if(TARGET CommonIRIR)
+    add_subdirectory(include/CommonIRToTTGIR)
+    add_subdirectory(lib/CommonIRToTTGIR)
+  endif()
+  if(TARGET TleCommonIRToTTGIR)
+    list(APPEND _slim_common_ir_libs TleCommonIRToTTGIR)
+  endif()
+  add_triton_plugin(TritonTLE
+    ${CMAKE_CURRENT_SOURCE_DIR}/triton_tle_commonir.cc
+    LINK_LIBS TritonIR ${_slim_common_ir_libs})
+  target_link_libraries(TritonTLE PRIVATE Python3::Module pybind11::headers)
+  if(TARGET CommonIRTableGen)
+    add_dependencies(TritonTLE CommonIRTableGen CommonIRAttrDefsIncGen CommonIRTypesIncGen)
+  endif()
+  if(TARGET TleCommonIRToTTGIRPassIncGen)
+    add_dependencies(TritonTLE TleCommonIRToTTGIRPassIncGen)
+  endif()
+  # bin/ 的 CLI 工具经 TRITON_LIBS 仍引用这三个老 tle 库名（瘦身路不建它们）。
+  # 建三个空 stub 库满足链接（bin 已剥 __TLE__，不需要它们的符号）。
+  set(_tle_stub "${CMAKE_CURRENT_BINARY_DIR}/tle_stub.cpp")
+  file(WRITE "${_tle_stub}" "")
+  foreach(_stub TritonTLEAnalysis TleToLLVM TritonTLETransforms)
+    if(NOT TARGET ${_stub})
+      add_library(${_stub} STATIC "${_tle_stub}")
+    endif()
+  endforeach()
+  return()
+endif()
+
 
 # flagtree tle
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/dialect/include)
@@ -70,7 +111,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   endif()
   add_dependencies(TritonTLE
     TleTableGen
-    TritonTLETransformsIncGen
+    TleTransformsIncGen
     TritonGPUTableGen
     TritonGPUAttrDefsIncGen
     ${TLE_TRITON_GPU_ATTR_DEPENDS}
