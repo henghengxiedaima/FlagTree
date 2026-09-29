@@ -1,3 +1,6 @@
+# [metax+CommonIR] 剥掉全局 __TLE__：metax 自身 lowering 按其 fork 的非-TLE 头编译
+remove_definitions(-D__TLE__)
+list(REMOVE_ITEM LLVM_TABLEGEN_FLAGS -D__TLE__)
 add_subdirectory(include)
 add_subdirectory(lib)
 

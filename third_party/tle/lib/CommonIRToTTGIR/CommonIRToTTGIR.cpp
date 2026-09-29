@@ -127,6 +127,23 @@ static LogicalResult convertFunctionArguments(
   return success();
 }
 
+// [CommonIR] The TritonGPU dialect exposes a warp_specialize op's explicit
+// captures directly on the op in most backends (upstream/metax/enflame/hcu),
+// but on the nested partitions op in others (mthreads). Pick whichever
+// accessor compiles so this generic pass stays backend-agnostic.
+namespace {
+template <typename Op>
+auto getWarpSpecializeExplicitCaptures(Op op, int)
+    -> decltype(op.getExplicitCaptures()) {
+  return op.getExplicitCaptures();
+}
+template <typename Op>
+auto getWarpSpecializeExplicitCaptures(Op op, long)
+    -> decltype(op.getPartitionOp().getExplicitCaptures()) {
+  return op.getPartitionOp().getExplicitCaptures();
+}
+} // namespace
+
 static LogicalResult convertWarpSpecializeCaptures(
     ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
     llvm::DenseMap<Value, Type> &convertedArgumentTypes,
@@ -135,7 +152,7 @@ static LogicalResult convertWarpSpecializeCaptures(
   module.walk([&](ttg::WarpSpecializeOp op) {
     if (failedConversion)
       return;
-    auto captures = op.getExplicitCaptures();
+    auto captures = getWarpSpecializeExplicitCaptures(op, 0);
     for (Region *region : op.getPartitionRegions()) {
       for (auto [index, capture] : llvm::enumerate(captures)) {
         BlockArgument argument = region->getArgument(index);
