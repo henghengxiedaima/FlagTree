@@ -98,10 +98,19 @@ def dump_tileir(path):
     print(f"[dump-tileir] wrote {path}")
 
 
+def _add_commonir_to_ttgir(pm, enable_async=False):
+    lib = __import__("triton._C.libtriton", fromlist=["tle", "iluvatar", "nvidia"])
+    for ns in ("tle", "iluvatar", "nvidia"):
+        add = getattr(getattr(getattr(getattr(lib, ns, None), "passes", None), "commonir", None), "add_to_ttgir", None)
+        if add is not None:
+            add(pm, enable_async)
+            return ns
+    raise RuntimeError("converted TTIR dump requires CommonIRToTTGIR (add_to_ttgir)")
+
+
 def dump_ttir(path):
     from triton._C.libtriton import ir
     from triton._C.libtriton import passes
-    from triton._C.libtriton import tle
 
     constants = {
         "BLOCK_M": 16,
@@ -127,7 +136,7 @@ def dump_ttir(path):
     passes.common.add_inliner(pm)
     pm.run(module, "native_matmul_gpu.inliner")
     pm = ir.pass_manager(module.context)
-    tle.passes.commonir.add_to_ttgir(pm, False)
+    _add_commonir_to_ttgir(pm, False)
     pm.run(module, "native_matmul_gpu.tileir_to_ttgir")
     text = str(module)
     for needle in ("tile.alloc", "tile.copy", "tile.to_tensor", "tile.store_tensor"):
@@ -142,9 +151,10 @@ def dump_ttir(path):
 
 def run_check(M=64, N=64, K=64):
     torch.manual_seed(0)
-    a = torch.randn((M, K), device="gcu", dtype=torch.float16)
-    b = torch.randn((K, N), device="gcu", dtype=torch.float16)
-    c = torch.empty((M, N), device="gcu", dtype=torch.float32)
+    device = "cuda" if torch.cuda.is_available() else "gcu"
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    c = torch.empty((M, N), device=device, dtype=torch.float32)
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 16))
     _matmul_gpu_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
                              c.stride(1), BLOCK_M=16, BLOCK_N=16, BLOCK_K=16)
