@@ -151,7 +151,13 @@ def dump_ttir(path):
 
 def run_check(M=64, N=64, K=64):
     torch.manual_seed(0)
-    device = "cuda" if torch.cuda.is_available() else "gcu"
+    _musa = False
+    try:
+        import torch_musa  # noqa: F401
+        _musa = torch.musa.is_available()
+    except Exception:
+        _musa = False
+    device = "cuda" if torch.cuda.is_available() else ("musa" if _musa else "gcu")
     a = torch.randn((M, K), device=device, dtype=torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float16)
     c = torch.empty((M, N), device=device, dtype=torch.float32)
