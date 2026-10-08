@@ -72,7 +72,7 @@ macro(flagtree_configure_options)
     set(ENV{PATH} "$ENV{LLVM_SYSPATH}/bin:$ENV{PATH}")
     set(CMAKE_C_COMPILER clang)
     set(CMAKE_CXX_COMPILER clang++)
-    if(NOT FLAGTREE_COMMON_IR_ENABLED)   # [mthreads+CommonIR] 走通用 tle CommonIR 前端时保持 TLE 开
+    if(NOT FLAGTREE_COMMON_IR_ENABLED)   # [mthreads+CommonIR] keep TLE on for shared CommonIR frontend
       set(FLAGTREE_TLE OFF)
     endif()
     set(FLAGTREE_MTHREADS_TLE ON)
@@ -93,7 +93,7 @@ macro(flagtree_configure_options)
       list(APPEND TRITON_PLUGIN_NAMES "mctle")
       add_definitions(-D__MCTLE__)
     endif()
-    if(NOT FLAGTREE_COMMON_IR_ENABLED)     # [metax+CommonIR] 走通用 tle 前端时保持 TLE 开
+    if(NOT FLAGTREE_COMMON_IR_ENABLED)     # [metax+CommonIR] keep TLE on for shared CommonIR frontend
       set(FLAGTREE_TLE OFF)
       remove_definitions(-D__TLE__)
       list(REMOVE_ITEM LLVM_TABLEGEN_FLAGS -D__TLE__)

@@ -164,7 +164,7 @@ std::string translateLLVMIRToILUVATAR(llvm::Module &module,
   // set data layout
   module.setDataLayout(machine->createDataLayout());
 
-  // Dump 加上 iluvatar 后端信息后的 llvm IR
+  // Dump LLVM IR after attaching Iluvatar backend metadata
   if (triton::tools::getBoolEnv("ILUIR_ENABLE_DUMP")) {
     llvm::dbgs()
         << "// -----// Iluvatar LLIR Dump after initialization //----- //\n"
@@ -250,7 +250,7 @@ std::string translateLLVMIRToILUVATAR(llvm::Module &module,
 
   mpm.run(module, mam);
 
-  // Dump 经过部分优化后的 llvm IR
+  // Dump LLVM IR after partial backend optimizations
   if (triton::tools::getBoolEnv("ILUIR_ENABLE_DUMP")) {
     llvm::dbgs()
         << "// -----// Iluvatar LLIR Dump before optimization //----- //\n"
@@ -263,7 +263,7 @@ std::string translateLLVMIRToILUVATAR(llvm::Module &module,
 
   pass.run(module);
 
-  // Dump 经过整个后端优化后的 llvm IR
+  // Dump LLVM IR after the full backend optimization pipeline
   if (triton::tools::getBoolEnv("ILUIR_ENABLE_DUMP")) {
     llvm::dbgs()
         << "// -----// Iluvatar LLIR Dump after optimization //----- //\n"

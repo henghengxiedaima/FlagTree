@@ -1,6 +1,6 @@
-// [metax+CommonIR] 瘦身 CommonIR-only tle binding。
-// 只镜像 triton_tle.cc 里 FLAGTREE_COMMON_IR 的 tile.* builder 方法，
-// 仅依赖 flir 的 CommonIR(tile)方言——不含 TLE-raw/Lite、不碰 ttng Hopper。
+// [metax+CommonIR] Slim CommonIR-only TLE bindings.
+// Mirrors only the FLAGTREE_COMMON_IR tile.* builder methods from triton_tle.cc.
+// Depends on FLIR CommonIR (tile) only — no TLE-raw/Lite and no ttng Hopper.
 #include "Python.h"
 #include "ir.h"
 #include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
