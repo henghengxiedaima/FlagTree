@@ -14,7 +14,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace mlir::triton {
 
@@ -606,6 +608,124 @@ static void combineCopyWaits(ArrayRef<ttg::AsyncCopyGlobalToLocalOp> copies) {
   }
 }
 
+// A buffer that is written once by tile.store_tensor and then read back by
+// tile.to_tensor carries no information the registers do not already hold: both
+// ops use the buffer's own layout, so every element is written and read by the
+// same thread. Keep the value and drop the buffer, its SMEM allocation and the
+// barrier the staging would need.
+//
+// This runs before the lowering so the decision is taken while the buffer is
+// still an explicit !tile.buf (single producer, single consumer) instead of a
+// memdesc whose uses have already been split across local_load/local_store.
+static void elideStoredTensorRoundTrips(ModuleOp module) {
+  static const bool disabled = [] {
+    const char *env = std::getenv("FLAGTREE_COMMONIR_NO_STAGING_ELIM");
+    return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+  }();
+  if (disabled)
+    return;
+
+  SmallVector<tile::ToTensorOp> reads;
+  module.walk([&](tile::ToTensorOp op) { reads.push_back(op); });
+
+  for (tile::ToTensorOp read : reads) {
+    Block *block = read->getBlock();
+    if (!block)
+      continue;
+    Value buffer = read.getSrc();
+    auto alloc = buffer.getDefiningOp<tile::AllocOp>();
+    if (!alloc)
+      continue;
+
+    tile::StoreTensorOp store;
+    bool unsupportedUse = false;
+    for (Operation *user : buffer.getUsers()) {
+      if (user == read.getOperation())
+        continue;
+      if (auto candidate = dyn_cast<tile::StoreTensorOp>(user);
+          candidate && candidate.getDst() == buffer && !store) {
+        store = candidate;
+        continue;
+      }
+      unsupportedUse = true;
+      break;
+    }
+    if (unsupportedUse || !store)
+      continue;
+    if (store->getBlock() != block || !store->isBeforeInBlock(read))
+      continue;
+    if (store.getSrc().getType() != read.getResult().getType())
+      continue;
+
+    read.getResult().replaceAllUsesWith(store.getSrc());
+    read.erase();
+    store.erase();
+    if (alloc->use_empty())
+      alloc.erase();
+  }
+
+  // Second phase: a buffer filled by a plain global->shared copy and read back
+  // by tile.to_tensor is a pass-through. Feed the readers the loaded value
+  // directly instead of staging it through shared memory (and paying for the
+  // allocation plus the barrier the round trip needs).
+  //
+  // Correctness only needs the copy to cover the whole buffer and to be a plain
+  // ND copy: tile.copy and tile.to_tensor index elements logically, so the
+  // value each reader observes is the same one the load produces.
+  SmallVector<tile::ToTensorOp> copyReads;
+  module.walk([&](tile::ToTensorOp op) { copyReads.push_back(op); });
+
+  for (tile::ToTensorOp read : copyReads) {
+    Block *block = read->getBlock();
+    if (!block)
+      continue;
+    Value buffer = read.getSrc();
+    auto alloc = buffer.getDefiningOp<tile::AllocOp>();
+    if (!alloc)
+      continue;
+
+    tile::CopyOp copy;
+    bool unsupportedUse = false;
+    for (Operation *user : buffer.getUsers()) {
+      if (user == read.getOperation())
+        continue;
+      if (auto candidate = dyn_cast<tile::CopyOp>(user);
+          candidate && candidate.getDst() == buffer && !copy) {
+        copy = candidate;
+        continue;
+      }
+      unsupportedUse = true;
+      break;
+    }
+    if (unsupportedUse || !copy)
+      continue;
+    if (copy->getBlock() != block || !copy->isBeforeInBlock(read))
+      continue;
+    if (copy.getSrcLayout() && *copy.getSrcLayout() != tile::Layout::ND)
+      continue;
+
+    auto pointers = dyn_cast<RankedTensorType>(copy.getSrc().getType());
+    if (!pointers)
+      continue;
+    auto pointer = dyn_cast<triton::PointerType>(pointers.getElementType());
+    if (!pointer || pointer.getAddressSpace() != 1)
+      continue;
+    if (RankedTensorType::get(pointers.getShape(), pointer.getPointeeType()) !=
+        read.getResult().getType())
+      continue;
+
+    OpBuilder builder(read);
+    Value loaded = builder.create<triton::LoadOp>(
+        read.getLoc(), copy.getSrc(), triton::CacheModifier::NONE,
+        triton::EvictionPolicy::NORMAL, false);
+    read.getResult().replaceAllUsesWith(loaded);
+    read.erase();
+    copy.erase();
+    if (alloc->use_empty())
+      alloc.erase();
+  }
+}
+
 class CommonIRToTTGIRPass
     : public impl::TleCommonIRToTTGIRBase<CommonIRToTTGIRPass> {
 public:
@@ -613,6 +733,7 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    elideStoredTensorRoundTrips(module);
     llvm::DenseMap<Value, Value> mapped;
     llvm::DenseMap<Value, Type> convertedArgumentTypes;
     SmallVector<Operation *> eraseOps;
