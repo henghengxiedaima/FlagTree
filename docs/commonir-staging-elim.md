@@ -80,13 +80,15 @@ CUDA_VISIBLE_DEVICES=0 TRITON_ALWAYS_COMPILE=1 \
 
 | 算子 | 规模 | A 原生 Triton | B TLE 原生 | C 无优化 | D 有优化 | C→D |
 |---|---|---|---|---|---|---|
-| RMSNorm | 4096×1024 | 0.0371 / 904 | —† | 0.0385 / 872（1.027×） | 0.0374 / 896（1.008×） | **+2.7%** |
-| softmax | 4096×1024 | 0.0381 / 880 | —† | 0.0400 / 838（1.045×） | 0.0383 / 877（1.004×） | **+4.1%** |
+| RMSNorm | 4096×1024 | 0.0371 / 904 | 0.0378–0.0379 / 884–889 | 0.0385 / 872（1.027×） | 0.0374 / 896（1.008×） | **+2.7%** |
+| softmax | 4096×1024 | 0.0381 / 880 | 0.0399–0.0401 / 837–841 | 0.0400 / 838（1.045×） | 0.0383 / 877（1.004×） | **+4.1%** |
 | RMSNorm | 65536×1024 | 0.3709 / 1448 | 0.3768 / 1425 | 0.3731 / 1439 | 0.3711 / 1447 | +0.5% |
 | softmax | 65536×1024 | 0.3730 / 1440 | 0.3763 / 1427 | 0.3734 / 1438 | 0.3730 / 1439 | ±0 |
 
 SMEM：C 8192 B → D 16 B（仅剩归约 scratch），B 8192 B。
-† 小尺寸的 B 组需在非 CommonIR 构建中重测（本轮只在大尺寸采集）。
+
+小尺寸下 **B ≈ C**（softmax 完全一致，RMSNorm 上 B 甚至比 C 快 1.6%），说明 C 的亏损来自那两块暂存 buffer
+本身，而不是 CommonIR 层独有的东西；D 把两者一起消掉后回到 A 的水平。
 
 结论：归约类三者打平，均贴 roofline —— **我们的变换没有让"本来该用 smem"的算子变慢**。
 
@@ -163,8 +165,10 @@ D 在 64M elementwise 上达到 1451–1463 GB/s ≈ **99–100% roofline**。
 
 ## 8. 复现清单
 
-- [x] MetaX C550：elementwise / softmax / RMSNorm / matmul
+- [x] MetaX C550：elementwise（3 尺寸 × 2 种 tile）/ softmax / RMSNorm（2 尺寸，A/B/C/D 齐全）/ matmul（3 尺寸）
+- [x] MetaX roofline（copy / triad / read / torch add）
 - [ ] HCU、Enflame、Iluvatar（B 组可直接测；C/D 需 CommonIR 构建）
 - [ ] MThreads（注意 TLE 与 CommonIR 耦合）
 - [ ] B 组 matmul 的正式开关（`FLAGTREE_METAX_ALLOW_TLE_DOT=1`）
-- [ ] 同一构建内重测 A/B/C/D 对齐表
+- [ ] 同一构建内重测 A/B/C/D 对齐表（当前 A/B 与 C/D 跨构建）
+- [ ] 定稿协议复测（3 进程中位数）
