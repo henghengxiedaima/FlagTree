@@ -7,8 +7,9 @@
 
 在 CommonIR（`tile.*` / `!tile.buf`）层识别并消除“写一次、读一次”的透传 SMEM 暂存，
 可以把 CommonIR 路径相对原生 Triton 的 5.6%–12.6%（elementwise，BLOCK=4096）与 1.6%–4.0%（归约，小尺寸）亏损全部收回，
-在 matmul 上相对 TLE 原生路径取得 1.37×（1024³）的优势；
-同时共享内存降至 0（elementwise）/16 B（归约），寄存器数下降 4–12 个；对带宽受限且已饱和的算子不产生回退。
+在 matmul 上相对未优化的 CommonIR 路径取得 1.37×（1024³）的提升，并解除大 tile 下的共享内存硬约束
+（BLOCK≥8192 时未优化路径编译失败）。**在全部已测算子上，D 与原生 Triton 持平（D/A = 0.99–1.00）**——
+即本文的价值是"消除抽象层引入的开销与资源约束"，而非超越原生 Triton。
 
 ## 2. 实现
 
@@ -81,14 +82,21 @@ SMEM：C 8192 B → D 16 B（仅剩归约 scratch），B 8192 B。
 
 ### 4.4 matmul（fp16 输入 / fp32 累加）
 
-| 尺寸 | B TLE 原生* | C | D | D/B | D/C |
-|---|---|---|---|---|---|
-| 1024³ | 0.3730 / 5.76 TF | 0.3737 / 5.75 TF | **0.2730 / 7.87 TF** | **1.37×** | 1.37× |
-| 2048³ | 21.86 / 0.79 TF | 18.6 / 0.95 TF | 4.85 / 3.35 TF | ~4.5× | ~3.8× |
-| 4096³ | — | 106.59 / 1.29 TF | 103.38 / 1.33 TF | — | 1.03× |
+| 尺寸 | A 原生 Triton | B TLE 原生* | C | D | D/A | D/C |
+|---|---|---|---|---|---|---|
+| 1024³ | 0.2729 / 7.87 TF | 0.3730 / 5.76 TF | 0.3737 / 5.75 TF | **0.2730 / 7.87 TF** | 1.00 | **1.37×** |
+| 2048³ | 5.8–6.0 / ~2.2 TF | 21.86 / 0.79 TF | 19.3 / 0.87 TF | 2.00 / 8.59 TF | – | ~9.7× |
+| 4096³ | 103.96 / 1.32 TF | — | 106.59 / 1.29 TF | 103.38 / 1.33 TF | 0.99 | 1.03× |
+
+**关键：D 与 A 在 1024³ / 4096³ 上完全持平（D/A = 1.00 / 0.99）。**
+即 matmul 上的 1.37× 是相对 C（以及 B）的，不是相对原生 Triton 的；2048³ 各方方差都大，仅作参考。
 
 SMEM：C 1024 B → D 2048 B（D 让 dot 的 lowering 自分配布局正确的 smem）。
 2048³ 三次测量方差很大（D: 2.0–5.1 ms，C: 18.1–23.6 ms），受同机其它负载影响，正文以 1024³ 为主、4096³ 为辅。
+
+> **2048³ 的 A vs D 差异待查（暂不入正文）**：同进程交替测量得到 A 5.8–6.0 ms、D 2.00 ms（约 2×），
+> 但两者的 TTGIR 逐行比对（循环体、mask、dot、smem 操作数）完全一致，机制尚未定位，
+> 可能是更下游（LLVM 调度/寄存器分配）或启动参数的差异。在解释清楚之前不作为论文数据。
 
 \* B 组 matmul 需 `FLAGTREE_METAX_ALLOW_TLE_DOT=1`（默认被 `TritonTleRejectDotOp` 拒绝）。
 
@@ -159,6 +167,16 @@ plain kernel 不含 `tile.*`，变换天然不触发。
 
 该错误来自 metax **瘦身绑定缺少 `get_memdesc_type`**（前端能力缺口），与本文变换无关。
 
+### 4.11 SMEM 受限：未优化路径在 BLOCK ≥ 8192 时无法编译
+
+| 配置（elementwise，64M） | C | D | A |
+|---|---|---|---|
+| BLOCK=8192 | ❌ `OutOfResources: shared memory, Required 98304, limit 65536` | ✅ 0 B，0.5567 ms / 1446 GB/s | ✅ 0.5597 ms / 1439 GB/s |
+| BLOCK=16384 | ❌ `Required 196608` | ✅ 0 B，0.5581 ms / 1443 GB/s | ✅ 0.5563 ms / 1448 GB/s |
+
+结论：**未优化的 CommonIR 路径在大 tile 下直接不可用（编译期失败）；本文方法解除该硬约束，且性能与原生 Triton 持平。**
+这是"能力"层面的结果，而不是提速结果。
+
 ## 5. 分析
 
 1. **亏损来源**：CommonIR/TLE 路径对每个 buffer 无条件做 `global→smem→reg`（及反向），
@@ -192,8 +210,9 @@ plain kernel 不含 `tile.*`，变换天然不触发。
 
 ## 8. 复现清单
 
-- [x] MetaX C550：elementwise（3 尺寸 × 2 种 tile）/ softmax / RMSNorm（2 尺寸，A/B/C/D）/ matmul（3 尺寸）
+- [x] MetaX C550：elementwise（3 尺寸 × 2 种 tile，含 BLOCK=8192/16384 的 SMEM 受限扫描）/ softmax / RMSNorm（2 尺寸，A/B/C/D）/ matmul（3 尺寸，A/B/C/D）
 - [x] MetaX roofline、资源占用、边界用例、覆盖率、精度回归
+- [ ] B 组 matmul 4096³（需切回非 CommonIR 构建）
 - [ ] HCU、Enflame、Iluvatar（B 组可直接测；C/D 需 CommonIR 构建）
 - [ ] MThreads（注意 TLE 与 CommonIR 耦合）
 - [ ] 同一构建内重测 A/B/C/D 对齐表（当前 A/B 与 C/D 跨构建）
