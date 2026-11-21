@@ -40,8 +40,9 @@ from .core import (
     reinterpret_tensor_map,
 )
 from .types import (layout, distributed_encoding, BlockEncoding, MmaEncoding, DotOperandEncoding, SlicedEncoding,
-                    shared_layout, swizzled_shared_layout, tensor_memory_layout, nv_mma_shared_layout, scope,
-                    buffered_tensor, buffered_tensor_type, barrier, barrier_type, smem, tmem, PENDING, READY)
+                    distributed_linear_layout, shared_linear_layout, shared_layout, swizzled_shared_layout,
+                    tensor_memory_layout, nv_mma_shared_layout, scope, buffered_tensor, buffered_tensor_type, barrier,
+                    barrier_type, smem, tmem, PENDING, READY)
 
 # Backward-compat alias expected by existing tests/tutorials.
 storage_kind = memory_space
@@ -71,6 +72,8 @@ __all__ = [
     "MmaEncoding",
     "DotOperandEncoding",
     "SlicedEncoding",
+    "distributed_linear_layout",
+    "shared_linear_layout",
     "memory_space",
     "shared_layout",
     "swizzled_shared_layout",

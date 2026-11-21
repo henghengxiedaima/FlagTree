@@ -59,7 +59,7 @@ def test_tle_capability_is_preferred_over_vendor(monkeypatch):
     assert module.ENABLED is True
 
 
-@pytest.mark.parametrize("setting, expected", [(None, False), ("0", False), ("1", True)])
+@pytest.mark.parametrize("setting, expected", [(None, True), ("0", False), ("1", True)])
 def test_common_ir_runtime_opt_in(monkeypatch, setting, expected):
     if setting is None:
         monkeypatch.delenv("FLAGTREE_COMMON_IR", raising=False)

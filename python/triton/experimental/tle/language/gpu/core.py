@@ -35,6 +35,7 @@ from .mthreads import warp_specialize as mthreads_warp_specialize
 from .mthreads import wgmma as mthreads_wgmma
 from .iluvatar import copy as iluvatar_copy
 from .iluvatar import layout as iluvatar_layout
+from .metax import layout as metax_layout
 from triton.compiler.code_generator import flatten_values_to_ir, unflatten_ir_values
 
 from triton.language.core import (
@@ -94,6 +95,8 @@ def set_layout(value, layout, _semantic=None):
         int(getattr(options, "num_ctas", 1)),
     )
     target_encoding = layout.to_ir(_semantic.builder)
+    if tle_semantic.COMMON_IR_ENABLED and hasattr(_semantic.builder, "create_tile_set_layout"):
+        return tl.tensor(_semantic.builder.create_tile_set_layout(value.handle, target_encoding), value.type)
     return tl.tensor(
         _semantic.builder.create_tle_gpu_set_layout(value.handle, target_encoding),
         value.type,
@@ -477,6 +480,7 @@ def alloc(
             raise ValueError("GPU CommonIR alloc does not yet support alias buffers")
     mthreads_auto_sqmma_shared_layout = (mthreads_common.enabled() and storage == tle.smem
                                          and mthreads_wgmma.use_auto_shared_layout(layout, nv_mma_shared_layout))
+    metax_auto_shared_layout = storage == tle.smem and metax_layout.use_auto_shared_layout(layout)
 
     try:
         unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
@@ -547,6 +551,8 @@ def alloc(
                 if iluvatar_copy.enabled():
                     layout, layout_handle = iluvatar_layout.select_default_smem_layout(
                         _semantic.builder, unwrapped_shape, dtype, nv_mma_shared_layout)
+                elif metax_auto_shared_layout:
+                    layout, layout_handle = metax_layout.select_default_smem_layout(_semantic.builder, unwrapped_shape)
                 elif mthreads_auto_sqmma_shared_layout or not nv_mma_shared_layout:
                     layout = tle.swizzled_shared_layout.make_default(rank=len(unwrapped_shape))
                     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
@@ -585,7 +591,7 @@ def alloc(
             layout_handle = layout.to_ir(_semantic.builder)
 
         if tle_semantic.COMMON_IR_ENABLED:
-            return tle_semantic.alloc(
+            buffer = tle_semantic.alloc(
                 unwrapped_shape,
                 dtype,
                 storage,
@@ -594,6 +600,9 @@ def alloc(
                 init_value,
                 _semantic,
             )
+            if metax_auto_shared_layout:
+                buffer.handle.set_attr("metax.auto_shared_layout", _semantic.builder.get_unit_attr())
+            return buffer
 
         if storage == tle.smem:
             if alias is not None:

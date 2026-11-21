@@ -150,6 +150,12 @@ class MACAOptions:
     inner_stages: Tuple[int, int] = field(default_factory=lambda: (0, 0))
 
     def __post_init__(self):
+        scenarios = set(parse_option(self.scenario))
+        if "commonir-fa-fwd" in scenarios:
+            if self.pipeline != "basic" or self.num_stages != 2:
+                raise ValueError("commonir-fa-fwd requires pipeline='basic' and num_stages=2")
+            if scenarios & {"mla", "flashattn-fwd", "flashattn-bwd"}:
+                raise ValueError("commonir-fa-fwd cannot be combined with another attention scenario")
         default_libdir = os.getenv("MACA_PATH") + '/lib'
         ext_default_libdir = Path(__file__).parent / 'lib'
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -176,6 +182,14 @@ class MACAOptions:
         hash_dict = dict(self.__dict__)
         key = "_".join([f"{name}-{val}" for name, val in sorted(hash_dict.items())])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _add_commonir_layout_passes(pm, mod):
+    passes.commonir.add_optimize_shared_layouts(pm)
+    passes.commonir.add_coalesce_async_copy(pm)
+    if mod.get_operation().get_bool_attr("metax.layout_tuned"):
+        passes.commonir.add_optimize_tensor_tile_layouts(pm)
+        passes.commonir.add_lower_tensor_tiles(pm)
 
 
 class MACABackend(BaseBackend):
@@ -279,13 +293,18 @@ class MACABackend(BaseBackend):
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 64, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
+        if COMMON_IR_ENABLED:
+            _add_commonir_layout_passes(pm, mod)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+        has_layout_hints = COMMON_IR_ENABLED and passes.commonir.has_layout_hints(mod)
         if enable_mctle:
             mctle.passes.add_reject_dot_op(pm)
             mctle.passes.add_early_assign_memory_space(pm)
-            mctle.passes.add_select_encodings(pm)
+            # The prebuilt MCTLE selector does not preserve explicit layouts.
+            if not has_layout_hints:
+                mctle.passes.add_select_encodings(pm)
             mctle.passes.add_insert_local_pointer_barriers(pm)
             mctle.passes.add_optimize_local_pointer_loads(pm)
             mctle.passes.add_optimize_local_pointer_stores(pm)
@@ -330,6 +349,8 @@ class MACABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.common.add_canonicalizer(pm)
+        if COMMON_IR_ENABLED:
+            passes.commonir.add_clear_layout_hints(pm)
         pm.run(mod, 'make_ttgir')
         return mod
 
@@ -413,7 +434,13 @@ class MACABackend(BaseBackend):
         if mxcc_arch is None:
             raise RuntimeError('mxcc_arch is None (not specified)')
         compile_options = ""
-        if (opt.pipeline == "basic" or opt.pipeline == "basic-prefetch") and "mla" not in scenarios:
+        if "commonir-fa-fwd" in scenarios:
+            # Match Gluon's gluon-flashattn-fwd preset. Keep K16 shared-read
+            # base + constant offsets intact across LICM and register allocation.
+            compile_options = (" -mllvm -metaxgpu-mma-sched=true -mllvm -map-use-pk-fma=1"
+                               " -mllvm -metaxgpu-split-regalloc=true -mllvm -metaxgpu-aggressive-fold=true"
+                               " -mllvm -metaxgpu-disable-licm=true ")
+        elif (opt.pipeline == "basic" or opt.pipeline == "basic-prefetch") and "mla" not in scenarios:
             compile_options = " -mllvm -metaxgpu-sched-regpressure=false "
             if "fullstage" in scenarios:
                 compile_options += " -mllvm -metaxgpu-vectorize-slp=true -mllvm -metaxgpu-igroup "
