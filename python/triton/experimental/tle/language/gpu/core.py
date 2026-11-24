@@ -1815,7 +1815,12 @@ def local_ptr(
         result_ty = tl.block_type(ptr_dtype, list(view_shape))
         result_ir = result_ty.to_ir(_semantic.builder)
     if tle_semantic.COMMON_IR_ENABLED and remote_buffer_marker:
-        raise ValueError("GPU CommonIR local_ptr does not yet support remote buffers")
+        options = getattr(_semantic.builder, "options", None)
+        # CUDA cluster shared memory is available on SM90 and newer.
+        arch = getattr(options, "arch", None)
+        if (getattr(options, "backend_name", None) != "cuda" or not isinstance(arch, str)
+                or not arch.startswith("sm") or not arch[2:].isdigit() or int(arch[2:]) < 90):
+            raise ValueError("GPU CommonIR local_ptr does not yet support remote buffers")
     local_ptr_op = tle_semantic.local_ptr(result_ir, buffer, idx_tensors, _semantic)
 
     result_tensor = tl.tensor(local_ptr_op.get_result(0), result_ty)
