@@ -55,7 +55,7 @@ def _wrap_results(args, alias_indices, dsl_region_op, *, smem: bool, tile_builde
                 aliased.type.storage,
                 aliased.type.layout,
                 aliased.type.semantic,
-                alloc_shape=aliased.type.alloc_shape,
+                alloc_shape=aliased.type.alloc_shape if tile_builder is not None else None,
             )
             buffer_tensors.append(buffer)
         if len(buffer_tensors) == 1:
@@ -79,7 +79,7 @@ def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic: TLESeman
         mark_kernel_init_hook(_semantic, _generator)
     hint = _normalize_hint(hint)
     tile_builder = None
-    if smem and gpu_semantic.COMMON_IR_ENABLED:
+    if smem and FLAGTREE_BACKEND != "iluvatar" and gpu_semantic.COMMON_IR_ENABLED:
         tile_builder = _semantic.builder
     values = [_semantic.to_tensor(arg) if isinstance(arg, tl_constexpr) else arg for arg in args]
     # Raw calls hand native memref descriptors to the LLVM function, so a

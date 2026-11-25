@@ -476,7 +476,7 @@ def alloc(
             if mthreads_enabled:
                 raise ValueError("mthreads TLE alloc does not support tmem storage")
             raise ValueError("GPU CommonIR currently supports only shared-memory buffers")
-        if alias is not None and not hasattr(_semantic.builder, "create_tile_buffer_from_memdesc"):
+        if alias is not None:
             raise ValueError("GPU CommonIR alloc does not yet support alias buffers")
     mthreads_auto_sqmma_shared_layout = (mthreads_enabled and storage == tle.smem
                                          and mthreads_wgmma.use_auto_shared_layout(layout, nv_mma_shared_layout))
@@ -587,8 +587,8 @@ def alloc(
             # Use provided layout
             layout_handle = layout.to_ir(_semantic.builder)
 
-        if tle_semantic.COMMON_IR_ENABLED and alias is None:
-            buffer = tle_semantic.alloc(
+        if tle_semantic.COMMON_IR_ENABLED:
+            return tle_semantic.alloc(
                 unwrapped_shape,
                 dtype,
                 storage,
@@ -597,15 +597,11 @@ def alloc(
                 init_value,
                 _semantic,
             )
-            if mthreads_auto_sqmma_shared_layout:
-                buffer.handle.set_attr("musa_tle.auto_shared_layout", _semantic.builder.get_unit_attr())
-            return buffer
 
         if storage == tle.smem:
             if alias is not None:
                 alias_ty = _semantic.builder.get_memdesc_type(storage_shape, elem_type, layout_handle, "smem")
-                alias_handle = tle_semantic.get_memdesc(alias, _semantic)
-                tensor_handle = _semantic.builder.create_memdesc_alias(alias_ty, alias_handle, alias_offset_bytes)
+                tensor_handle = _semantic.builder.create_memdesc_alias(alias_ty, alias.handle, alias_offset_bytes)
             else:
                 if init_value is None:
                     tensor_handle = _semantic.builder.create_local_alloc(storage_shape, elem_type, layout_handle)
@@ -650,7 +646,7 @@ def alloc(
             raise ValueError(f"Storage type {storage} not yet supported")
 
         if use_mthreads_buffer:
-            buffer = mthreads_buffer.create_buffered_tensor(
+            return mthreads_buffer.create_buffered_tensor(
                 tensor_handle,
                 dtype,
                 unwrapped_shape,
@@ -658,12 +654,7 @@ def alloc(
                 layout,
                 _semantic,
             )
-        else:
-            buffer = tle.buffered_tensor(tensor_handle, dtype, storage_shape, storage, layout, _semantic)
-        if tle_semantic.COMMON_IR_ENABLED:
-            buffer.handle = _semantic.builder.create_tile_buffer_from_memdesc(buffer.type.to_ir(_semantic.builder),
-                                                                              buffer.handle)
-        return buffer
+        return tle.buffered_tensor(tensor_handle, dtype, storage_shape, storage, layout, _semantic)
 
     except Exception as e:
         raise RuntimeError(f"Memory allocation failed: {str(e)}") from e
@@ -1569,7 +1560,7 @@ def copy(
     if other is not None and mask is None:
         raise ValueError("copy other requires a mask: it is the fill value of the lanes the mask excludes")
 
-    if tle_semantic.COMMON_IR_ENABLED and not mthreads_enabled:
+    if tle_semantic.COMMON_IR_ENABLED:
         if is_async:
             raise ValueError("GPU CommonIR copy does not support explicit async transport")
         if other is not None:
@@ -1599,16 +1590,6 @@ def copy(
             if tl._unwrap_if_constexpr(offsets) is not None:
                 raise ValueError(
                     "GPU CommonIR normal copy does not support offsets; offset the global pointers instead")
-            buffer, pointers = (dst, src) if direction == CopyDirection.GM_TO_LOCAL else (src, dst)
-            requested_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in shape)
-            buffer_shape = tuple(buffer.type.shape)
-            if requested_shape != buffer_shape or tuple(pointers.shape) != buffer_shape:
-                raise ValueError("GPU CommonIR copy requires shape and pointer tensor shape to match the full buffer")
-            if not pointers.dtype.is_ptr() or pointers.dtype.element_ty != buffer.dtype:
-                raise ValueError("GPU CommonIR copy requires pointers with the buffer element type")
-            if iluvatar_enabled and direction == CopyDirection.GM_TO_LOCAL:
-                # Iluvatar's async and SME passes match stores through local pointers.
-                return normcopy(src, dst, shape, direction, mask, other, _semantic)
         return tle_semantic.copy(
             src,
             dst,
