@@ -631,7 +631,9 @@ convertTileUsers(ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
           Value value = builder.create<triton::LoadOp>(
               op.getLoc(), src, triton::CacheModifier::NONE,
               triton::EvictionPolicy::NORMAL, false);
-          builder.create<ttg::LocalStoreOp>(op.getLoc(), value, dst);
+          auto store =
+              builder.create<ttg::LocalStoreOp>(op.getLoc(), value, dst);
+          store->setAttr("tle.commonir_copy", builder.getUnitAttr());
         }
       } else if (isa<ttg::MemDescType>(src.getType()) &&
                  isPointerLike(dst.getType())) {

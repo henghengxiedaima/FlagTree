@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 from triton._common_ir import ENABLED
+from triton.experimental.tle import is_tle_supported
 
 pytestmark = pytest.mark.skipif(not ENABLED, reason="requires FLAGTREE_COMMON_IR build")
 
@@ -66,6 +67,8 @@ def _invalid(src, CASE: tl.constexpr):
     (8, "barrier is only supported for global-to-shared TMA copy"),
 ])
 def test_invalid_buffer_semantics(case, message):
+    if case == 8 and not is_tle_supported("gpu.alloc_barrier"):
+        pytest.skip("backend does not support gpu.alloc_barrier")
     src = torch.empty(16, dtype=torch.float32, device="cuda")
     with pytest.raises(triton.CompilationError, match=message):
         _invalid[(1, )](src, case)

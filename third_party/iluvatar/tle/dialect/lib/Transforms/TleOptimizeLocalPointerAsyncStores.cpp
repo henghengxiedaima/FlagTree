@@ -530,7 +530,20 @@ static bool shouldDeferToPipeliner(AsyncStoreCandidate &candidate,
     return false;
 
   tt::StoreOp store = candidate.store;
-  return readsBackIntoDot(store.getPtr());
+  if (readsBackIntoDot(store.getPtr()))
+    return true;
+
+  Value storePtr = stripConvertLayouts(store.getPtr());
+  auto pointers = storePtr.getDefiningOp<LocalPointersOp>();
+  if (!pointers || !pointers->hasAttr("tle.commonir_copy"))
+    return false;
+  // A lowered tile.copy creates its own full-buffer pointer view. Dot readers
+  // can use a different view of the same memdesc.
+  for (Operation *user : candidate.match.baseMemDesc.getUsers())
+    if (auto view = dyn_cast<LocalPointersOp>(user))
+      if (readsBackIntoDot(view.getResult()))
+        return true;
+  return false;
 }
 
 static void rewriteAsyncStoreGroup(ArrayRef<AsyncStoreCandidate *> group,

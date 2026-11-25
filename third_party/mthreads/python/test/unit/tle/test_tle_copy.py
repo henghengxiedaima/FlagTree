@@ -342,9 +342,12 @@ def test_tle_copy_normal_gmem_to_smem_lowers_to_async_copy():
 
 
 def test_tle_copy_normal_rejects_shape_mismatch():
+    from triton._common_ir import ENABLED as COMMON_IR_ENABLED
     from triton.compiler.errors import CompilationError
 
-    with pytest.raises(CompilationError, match="copy shape .* must match"):
+    message = ("copy requires shape and pointer tensor shape to match the full buffer"
+               if COMMON_IR_ENABLED else "copy shape .* must match")
+    with pytest.raises(CompilationError, match=message):
         compile_musa(
             _normal_copy_shape_mismatch_kernel,
             signature={"src": "*fp32", "dst": "*fp32", "BLOCK": "constexpr"},

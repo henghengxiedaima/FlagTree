@@ -1569,7 +1569,9 @@ def copy(
     if other is not None and mask is None:
         raise ValueError("copy other requires a mask: it is the fill value of the lanes the mask excludes")
 
-    if tle_semantic.COMMON_IR_ENABLED and not mthreads_enabled:
+    # MThreads tensor descriptors use the native TME binding. Pointer copies
+    # still follow the CommonIR contract when it is enabled.
+    if tle_semantic.COMMON_IR_ENABLED and (not mthreads_enabled or is_normcopy):
         if is_async:
             raise ValueError("GPU CommonIR copy does not support explicit async transport")
         if other is not None:
@@ -1606,9 +1608,6 @@ def copy(
                 raise ValueError("GPU CommonIR copy requires shape and pointer tensor shape to match the full buffer")
             if not pointers.dtype.is_ptr() or pointers.dtype.element_ty != buffer.dtype:
                 raise ValueError("GPU CommonIR copy requires pointers with the buffer element type")
-            if iluvatar_enabled and direction == CopyDirection.GM_TO_LOCAL:
-                # Iluvatar's async and SME passes match stores through local pointers.
-                return normcopy(src, dst, shape, direction, mask, other, _semantic)
         return tle_semantic.copy(
             src,
             dst,

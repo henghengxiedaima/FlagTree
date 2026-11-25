@@ -55,7 +55,7 @@ def _wrap_results(args, alias_indices, dsl_region_op, *, smem: bool, tile_builde
                 aliased.type.storage,
                 aliased.type.layout,
                 aliased.type.semantic,
-                alloc_shape=aliased.type.alloc_shape,
+                alloc_shape=aliased.type.alloc_shape if tile_builder is not None else None,
             )
             buffer_tensors.append(buffer)
         if len(buffer_tensors) == 1:

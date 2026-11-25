@@ -2252,6 +2252,25 @@ public:
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
 #ifdef __TLE__
+#ifdef __FLAGTREE_COMMON_IR__
+    // Give lowered tile.copy operations the same async-store optimization
+    // as native TLE full-buffer stores.
+    mod.walk([](LocalStoreOp store) {
+      if (!store->hasAttr("tle.commonir_copy"))
+        return;
+      auto valueType = cast<RankedTensorType>(store.getSrc().getType());
+      auto pointerType = RankedTensorType::get(
+          valueType.getShape(), PointerType::get(valueType.getElementType(), 3),
+          valueType.getEncoding());
+      OpBuilder builder(store);
+      auto pointers = builder.create<musa_tle::LocalPointersOp>(
+          store.getLoc(), pointerType, store.getDst(), ValueRange{});
+      builder.create<StoreOp>(store.getLoc(), pointers.getResult(),
+                              store.getSrc(), CacheModifier::NONE,
+                              EvictionPolicy::NORMAL);
+      store.erase();
+    });
+#endif
     // Attach the proof to the consuming reduction before the annotation can
     // disappear. Legal reductions retain it; TritonReducePattern copies it
     // with the other discardable attributes when changing the operand layout.
