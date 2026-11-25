@@ -347,9 +347,6 @@ convertAllocations(ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
             ? builder.create<ttg::LocalAllocOp>(op.getLoc(), *memDescType,
                                                 initialValue)
             : builder.create<ttg::LocalAllocOp>(op.getLoc(), *memDescType);
-    constexpr char autoSharedLayoutAttr[] = "musa_tle.auto_shared_layout";
-    if (Attribute layout = op->getAttr(autoSharedLayoutAttr))
-      alloc->setAttr(autoSharedLayoutAttr, layout);
     mapped[op.getResult()] = alloc;
     eraseOps.push_back(op);
     return WalkResult::advance();
@@ -631,9 +628,7 @@ convertTileUsers(ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
           Value value = builder.create<triton::LoadOp>(
               op.getLoc(), src, triton::CacheModifier::NONE,
               triton::EvictionPolicy::NORMAL, false);
-          auto store =
-              builder.create<ttg::LocalStoreOp>(op.getLoc(), value, dst);
-          store->setAttr("tle.commonir_copy", builder.getUnitAttr());
+          builder.create<ttg::LocalStoreOp>(op.getLoc(), value, dst);
         }
       } else if (isa<ttg::MemDescType>(src.getType()) &&
                  isPointerLike(dst.getType())) {

@@ -1454,26 +1454,6 @@ public:
     mod->setAttr(AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
-#if defined(__ILUVATAR_TLE__) && defined(__FLAGTREE_COMMON_IR__)
-    // Give lowered tile.copy operations the same layout and async-store
-    // optimizations as native TLE full-buffer stores.
-    mod.walk([](LocalStoreOp store) {
-      if (!store->hasAttr("tle.commonir_copy"))
-        return;
-      auto valueType = cast<RankedTensorType>(store.getSrc().getType());
-      auto pointerType = RankedTensorType::get(
-          valueType.getShape(), PointerType::get(valueType.getElementType(), 3),
-          valueType.getEncoding());
-      OpBuilder builder(store);
-      auto pointers = builder.create<iluvatar_tle::LocalPointersOp>(
-          store.getLoc(), pointerType, store.getDst(), ValueRange{});
-      pointers->setAttr("tle.commonir_copy", builder.getUnitAttr());
-      builder.create<StoreOp>(store.getLoc(), pointers.getResult(),
-                              store.getSrc(), CacheModifier::NONE,
-                              EvictionPolicy::NORMAL);
-      store.erase();
-    });
-#endif
     SmallVector<StringAttr> layoutFunctions;
     if (failed(applyTleEncodingHints(mod, layoutFunctions)))
       return signalPassFailure();
