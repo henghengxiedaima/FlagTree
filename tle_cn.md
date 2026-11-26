@@ -148,7 +148,7 @@ CommonIR 构建目前会对下列形式给出明确的前端错误，而不是�
 
 - 带 alias 的 `tle.gpu.alloc` buffer；
 - 带 mask 的 `tle.gpu.copy`，或在 GM 到 shared 的 TMA 拷贝之外使用完成屏障；
-- remote-buffer `tle.gpu.local_ptr`；
+- CUDA SM90 及以上线程块集群以外的远端缓冲区 `tle.gpu.local_ptr`；
 - 普通指针拷贝携带 offsets（应改为对指针操作数本身添加偏移）。
 
 构建完成后，可运行以下针对性检查：

@@ -1816,7 +1816,7 @@ def local_ptr(
         result_ir = result_ty.to_ir(_semantic.builder)
     if tle_semantic.COMMON_IR_ENABLED and remote_buffer_marker:
         options = getattr(_semantic.builder, "options", None)
-        # CUDA cluster shared memory is available on SM90 and newer.
+        # Cluster shared memory is available on CUDA targets starting at SM90.
         arch = getattr(options, "arch", None)
         if (getattr(options, "backend_name", None) != "cuda" or not isinstance(arch, str)
                 or not arch.startswith("sm") or not arch[2:].isdigit() or int(arch[2:]) < 90):

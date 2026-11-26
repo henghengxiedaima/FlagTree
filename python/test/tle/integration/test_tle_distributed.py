@@ -805,6 +805,17 @@ class TestTLEDistributed:
         _remote_roundtrip_kernel[(1, )](x, out, numel, BLOCK=block)
         torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
 
+    def test_commonir_remote_local_ptr_rejects_sm80(self):
+        from triton._common_ir import ENABLED
+        from triton._filecheck import run_parser
+        from triton.backends.compiler import GPUTarget
+
+        if not ENABLED:
+            pytest.skip("requires CommonIR")
+        data = torch.empty(128, device="cuda")
+        with pytest.raises(triton.CompilationError, match="local_ptr does not yet support remote buffers"):
+            run_parser(_remote_roundtrip_kernel, args=(data, data, 128, 128), target=GPUTarget("cuda", 80, 32))
+
     @pytest.mark.skip_if_tle_unsupported("distributed_barrier", "gpu.alloc", "gpu.local_ptr", "remote")
     def test_remote_read_peer_smem_same_cluster(self):
         block = 64
@@ -825,6 +836,8 @@ class TestTLEDistributed:
         )
         assert compiled.metadata.cluster_dims == (2, 1, 1)
         assert "tle.remote_pointers" in compiled.asm["ttgir"]
+        assert "!tile.buf" not in compiled.asm["ttgir"]
+        assert "unrealized_conversion_cast" not in compiled.asm["ttgir"]
         assert "\"ttg.num-ctas\" = 1" in compiled.asm["ttgir"]
         assert "mapa.shared::cluster" in compiled.asm["ptx"]
 
