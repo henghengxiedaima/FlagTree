@@ -76,6 +76,14 @@ def _masked_copy_zero_fill_kernel(src, dst):
 
 
 @triton.jit
+def _masked_copy_to_global_kernel(src, dst):
+    offsets = tl.arange(0, 16)
+    smem = tle.gpu.alloc([16], dtype=tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    tle.gpu.copy(src + offsets, smem, [16])
+    tle.gpu.copy(smem, dst + offsets, [16], mask=offsets < 8)
+
+
+@triton.jit
 def _masked_copy_other_frontend_kernel(src):
     offsets = tl.arange(0, 16)
     mask = offsets < 8
@@ -261,6 +269,14 @@ class TestCopyFrontend:
         _masked_copy_zero_fill_kernel[(1, )](src, dst, num_warps=4)
         expected = torch.cat((src[:8], torch.zeros_like(src[8:])))
         torch.testing.assert_close(dst, expected, atol=0, rtol=0)
+
+    @pytest.mark.skipif(not _cuda_backend_available(), reason="requires cuda backend")
+    @pytest.mark.skip_if_tle_unsupported("gpu.alloc", "gpu.copy")
+    def test_masked_copy_to_global_preserves_excluded_lanes(self):
+        src = torch.arange(16, device="cuda", dtype=torch.float32)
+        dst = torch.full_like(src, -1)
+        _masked_copy_to_global_kernel[(1, )](src, dst)
+        torch.testing.assert_close(dst, torch.cat((src[:8], torch.full_like(src[8:], -1))), atol=0, rtol=0)
 
     @staticmethod
     def _make_copy_buffer():
