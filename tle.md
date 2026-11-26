@@ -156,7 +156,7 @@ frontend diagnostic instead of silently bypassing CommonIR:
 
 - aliased `tle.gpu.alloc` buffers;
 - `tle.gpu.copy` with a mask, or a completion barrier outside global-to-shared TMA copy;
-- remote-buffer `tle.gpu.local_ptr`;
+- remote-buffer `tle.gpu.local_ptr` outside CUDA SM90+ thread block clusters;
 - normal pointer copies with offsets (offset the pointer operands instead).
 
 After building, the focused checks are:
