@@ -248,6 +248,33 @@ convertAllocations(ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
   return failure(result.wasInterrupted());
 }
 
+// Native views already have storage. Record their descriptors before converting
+// any TileIR users (including subviews and function arguments).
+static LogicalResult recordNativeBufferBridges(
+    ModuleOp module, llvm::DenseMap<Value, Value> &mapped,
+    SmallVectorImpl<Operation *> &eraseOps) {
+  WalkResult result = module.walk([&](UnrealizedConversionCastOp op) {
+    if (op.getInputs().size() != 1 || op->getNumResults() != 1)
+      return WalkResult::advance();
+    Value input = op.getInputs().front();
+    auto desc = dyn_cast<ttg::MemDescType>(input.getType());
+    auto buffer = dyn_cast<tile::BufType>(op.getResult(0).getType());
+    if (!desc || !buffer)
+      return WalkResult::advance();
+    if (buffer.getMemorySpace() != tile::MemorySpace::Shared ||
+        !isa<ttg::SharedMemorySpaceAttr>(desc.getMemorySpace()) ||
+        buffer.getShape() != desc.getShape() ||
+        buffer.getElementType() != desc.getElementType()) {
+      op.emitError("incompatible shared descriptor for a TileIR buffer");
+      return WalkResult::interrupt();
+    }
+    mapped[op.getResult(0)] = input;
+    eraseOps.push_back(op);
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
 static void
 rewriteConvertedOperands(ModuleOp module,
                          const llvm::DenseMap<Value, Value> &mapped) {
@@ -624,6 +651,7 @@ public:
     SmallVector<UnrealizedConversionCastOp> argumentCasts;
 
     if (failed(convertAllocations(module, mapped, eraseOps)) ||
+        failed(recordNativeBufferBridges(module, mapped, eraseOps)) ||
         failed(convertWarpSpecializeCaptures(
             module, mapped, convertedArgumentTypes, argumentCasts)) ||
         failed(convertFunctionArguments(module, mapped, convertedArgumentTypes,
