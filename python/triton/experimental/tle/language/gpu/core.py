@@ -1572,9 +1572,11 @@ def copy(
     if tle_semantic.COMMON_IR_ENABLED and not mthreads_enabled:
         if is_async:
             raise ValueError("GPU CommonIR copy does not support explicit async transport")
-        if other is not None:
+        options = getattr(_semantic.builder, "options", None)
+        cuda_masked = mask is not None and getattr(options, "backend_name", None) == "cuda"
+        if other is not None and not cuda_masked:
             raise ValueError("GPU CommonIR copy does not yet support other")
-        if mask is not None:
+        if mask is not None and not cuda_masked:
             raise ValueError("GPU CommonIR copy does not yet support masks")
         descriptor = src if isinstance(
             src, tl.tensor_descriptor) else (dst if isinstance(dst, tl.tensor_descriptor) else None)
@@ -1606,6 +1608,10 @@ def copy(
                 raise ValueError("GPU CommonIR copy requires shape and pointer tensor shape to match the full buffer")
             if not pointers.dtype.is_ptr() or pointers.dtype.element_ty != buffer.dtype:
                 raise ValueError("GPU CommonIR copy requires pointers with the buffer element type")
+            if cuda_masked:
+                # tile.copy has no mask operand. local_ptr bridges the CommonIR
+                # buffer to the descriptor used by the masked load or store.
+                return normcopy(src, dst, shape, direction, mask, other, _semantic)
             if iluvatar_enabled and direction == CopyDirection.GM_TO_LOCAL:
                 # Iluvatar's async and SME passes match stores through local pointers.
                 return normcopy(src, dst, shape, direction, mask, other, _semantic)
